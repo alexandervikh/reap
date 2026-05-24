@@ -659,7 +659,31 @@ class LayerwiseMoEObserver:
                 router_logits = result
             return router_logits
 
-        if self.hook_config.fused_experts:
+        if (
+            getattr(self.hook_config, "compute_router_logits_from_input", False)
+            or getattr(self.hook_config, "naive_expert_tensors", False)
+        ):
+            if hasattr(moe_module, "gate"):
+                router_logits = extract_router_logits(moe_module.gate, flat_input)
+            elif hasattr(moe_module, "router"):
+                router_logits = extract_router_logits(moe_module.router, flat_input)
+            else:
+                raise ValueError(
+                    f"Cannot find gate/router in MoE module at block {block_idx}"
+                )
+            if router_logits.dim() == 1:
+                router_logits = router_logits.view(-1, num_experts)
+            _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+            experts_mod = moe_module.experts
+            for idx in range(num_experts):
+                gate, up = torch.nn.functional.linear(
+                    flat_input, experts_mod.gate_up_proj[idx]
+                ).chunk(2, dim=-1)
+                hidden = experts_mod.act_fn(gate) * up
+                activations[idx] = torch.nn.functional.linear(
+                    hidden, experts_mod.down_proj[idx]
+                ).to(device)
+        elif self.hook_config.fused_experts:
             # Fused experts (e.g., Llama-4)
             router_logits = extract_router_logits(moe_module.router, flat_input)
             _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
@@ -694,8 +718,19 @@ class LayerwiseMoEObserver:
             _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
 
             # Compute activations for all experts
-            for idx, expert in enumerate(moe_module.experts):
-                activations[idx] = expert(flat_input).to(device)
+            if getattr(self.hook_config, "naive_expert_tensors", False):
+                experts_mod = moe_module.experts
+                for idx in range(num_experts):
+                    gate, up = torch.nn.functional.linear(
+                        flat_input, experts_mod.gate_up_proj[idx]
+                    ).chunk(2, dim=-1)
+                    hidden = experts_mod.act_fn(gate) * up
+                    activations[idx] = torch.nn.functional.linear(
+                        hidden, experts_mod.down_proj[idx]
+                    ).to(device)
+            else:
+                for idx, expert in enumerate(moe_module.experts):
+                    activations[idx] = expert(flat_input).to(device)
 
         update_pruning_state(
             self.state[block_idx],

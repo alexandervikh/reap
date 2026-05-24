@@ -80,6 +80,23 @@ Add model attribute names to `MODEL_ATTRS` in `src/reap/model_util.py`. Each ent
 - `num_experts`: The key in the huggingface config containing the number of experts per layer. (ie., `num_experts` if `model.config.num_experts` contains this value)
 - `num_experts_per_tok`: The key in the huggingface config containing the number of experts activated per token. 
 
+### GLM-5.1 (`GlmMoeDsaForCausalLM`)
+
+Requires `transformers>=5.4.0` (in-tree `glm_moe_dsa`). MoE uses fused expert tensors and a `gate` router with `e_score_correction_bias`; observer hooks compute router logits from `module.gate(flat_input)`.
+
+**Phase B (dev, FP8):** download + layerwise prune + optional HF lm-eval smoke:
+
+```bash
+python scripts/patch_glm_5_1.py
+bash scripts/glm_5_1_phase_b.sh
+```
+
+Or directly: `bash experiments/pruning-layerwise-cli.sh 0 zai-org/GLM-5.1-FP8 reap 42 0.25 theblackcat102/evol-codealpaca-v1 false false false false false`
+
+**Phase A (paper protocol, multi-GPU):** `bash scripts/glm_5_1_phase_a.sh` — agentic calibration mix (24576 samples) and `experiments/eval.sh` for EvalPlus, LiveCodeBench, BFCL, MC.
+
+Note: GLM-5.1-FP8 (~750GB) and BF16 (~1.5TB) exceed a single 143GB GPU; use layerwise calibration and multi-GPU / offload as needed. vLLM 0.10.0 may not support `glm_moe_dsa` for eval — use HF backend for smoke tests.
+
 
 ## Reproducing Experiments
 

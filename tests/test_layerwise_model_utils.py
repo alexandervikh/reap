@@ -6,6 +6,8 @@ from transformers import (
     Ernie4_5_MoeForCausalLM,
     Glm4MoeConfig,
     Glm4MoeForCausalLM,
+    GlmMoeDsaConfig,
+    GlmMoeDsaForCausalLM,
     Llama4ForCausalLM,
     Llama4TextConfig,
     MixtralConfig,
@@ -20,6 +22,7 @@ from reap.observer import (
     DeepSeekMoEObserverHookConfig,
     Ernie4_5MoEObserverHookConfig,
     Glm44MoEObserverHookConfig,
+    GlmMoeDsaObserverHookConfig,
     Llama4MoEObserverHookConfig,
     MixtralMoEObserverHookConfig,
     Qwen3MoEObserverHookConfig,
@@ -140,6 +143,36 @@ def _make_glm4_moe_model():
     return model
 
 
+def _make_glm_moe_dsa_model():
+    model = GlmMoeDsaForCausalLM(
+        GlmMoeDsaConfig(
+            vocab_size=32,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=3,
+            mlp_layer_types=["dense", "dense", "sparse"],
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=4,
+            num_experts_per_tok=1,
+            n_shared_experts=1,
+            q_lora_rank=16,
+            kv_lora_rank=16,
+            qk_nope_head_dim=12,
+            qk_rope_head_dim=4,
+            v_head_dim=16,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            indexer_types=["full", "full", "full"],
+            norm_topk_prob=False,
+        )
+    )
+    model.eval()
+    return model
+
+
 MODEL_FACTORIES = [
     pytest.param(_make_qwen3_moe_model, id="Qwen3MoeForCausalLM"),
     pytest.param(_make_llama4_model, id="Llama4ForCausalLM"),
@@ -147,6 +180,7 @@ MODEL_FACTORIES = [
     pytest.param(_make_deepseek_v2_model, id="DeepseekV2ForCausalLM"),
     pytest.param(_make_ernie4_5_moe_model, id="Ernie4_5_MoEForCausalLM"),
     pytest.param(_make_glm4_moe_model, id="Glm4MoeForCausalLM"),
+    pytest.param(_make_glm_moe_dsa_model, id="GlmMoeDsaForCausalLM"),
 ]
 
 
@@ -176,6 +210,10 @@ def _make_ernie4_5_hook_config():
 
 def _make_glm4_hook_config():
     return Glm44MoEObserverHookConfig()
+
+
+def _make_glm_moe_dsa_hook_config():
+    return GlmMoeDsaObserverHookConfig()
 
 
 MOE_LOOKUP_CASES = [
@@ -220,6 +258,13 @@ MOE_LOOKUP_CASES = [
         [1, 2],
         "mlp",
         id="Glm4MoeForCausalLM",
+    ),
+    pytest.param(
+        _make_glm_moe_dsa_model,
+        _make_glm_moe_dsa_hook_config,
+        [2],
+        "mlp",
+        id="GlmMoeDsaForCausalLM",
     ),
 ]
 

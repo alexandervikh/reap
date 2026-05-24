@@ -133,16 +133,23 @@ def prune(
                 )
             setattr(moe, model_attrs["router"], router)
         else:
-            # prune fused experts, only tested for llama-4
+            # prune fused experts (Llama-4, GlmMoeDsa, etc.)
             moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
                 retained_expert_indicies
             ]
             moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
-            moe.num_experts = len(retained_expert_indicies)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
-            moe.router.out_features = len(retained_expert_indicies)
-            if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
-                moe.router.num_experts = len(retained_expert_indicies)
+            moe.experts.num_experts = len(retained_expert_indicies)
+            if hasattr(moe, "n_routed_experts"):
+                moe.n_routed_experts = len(retained_expert_indicies)
+            router = getattr(moe, model_attrs["router"])
+            router.weight.data = router.weight.data[retained_expert_indicies]
+            router.out_features = len(retained_expert_indicies)
+            if hasattr(router, "num_experts"):
+                router.num_experts = len(retained_expert_indicies)
+            if hasattr(router, "e_score_correction_bias"):
+                router.e_score_correction_bias.data = router.e_score_correction_bias.data[
+                    retained_expert_indicies
+                ]
 
     # patch config and dump
     logger.info("Saving pruned model...")
@@ -312,13 +319,13 @@ def main():
 
         dump_args_to_yaml(
             pruned_model_dir,
-            reap_args,
-            ds_args,
-            obs_args,
-            model_args,
-            eval_args,
-            prune_args,
-            cluster_args,
+            reap_args=reap_args,
+            ds_args=ds_args,
+            obs_args=obs_args,
+            model_args=model_args,
+            eval_args=eval_args,
+            prune_args=prune_args,
+            cluster_args=cluster_args,
         )
 
     # eval

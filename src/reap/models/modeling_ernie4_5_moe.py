@@ -29,7 +29,12 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging, is_torch_flex_attn_available
+import transformers.utils as _transformers_utils
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging, is_torch_flex_attn_available
+
+if not hasattr(_transformers_utils, "LossKwargs"):
+    _transformers_utils.LossKwargs = TransformersKwargs
+LossKwargs = _transformers_utils.LossKwargs
 
 from .configuration_ernie4_5_moe import Ernie4_5_MoeConfig
 

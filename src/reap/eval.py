@@ -36,6 +36,8 @@ def get_original_model_name(model_name: str) -> Tuple[str, bool]:
         "gpt-oss-20b": "openai/gpt-oss-20b",
         "gpt-oss-120b": "openai/gpt-oss-120b",
         "GLM-4.5-Air": "zai-org/GLM-4.5-Air",
+        "GLM-5.1": "zai-org/GLM-5.1",
+        "GLM-5.1-FP8": "zai-org/GLM-5.1-FP8",
         "Qwen3-Coder-480B-A35B-Instruct-FP8": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
     }
 
@@ -266,7 +268,7 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
     try:
         if eval_args.run_evalplus:
             enable_thinking = True
-            if "qwen" in model_name.lower() or "glm-4.5" in model_name.lower():
+            if "qwen" in model_name.lower() or "glm" in model_name.lower():
                 logger.info("Disabling thinking for Qwen/GLM models")
                 enable_thinking = False
             for task in eval_args.evalplus_tasks:

@@ -220,6 +220,8 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     num_experts_attr_name: str = "num_experts"
     top_k_attr_name: str = "top_k"
     fused_experts: bool = False
+    compute_router_logits_from_input: bool = False
+    naive_expert_tensors: bool = False
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
     record_pruning_metrics_only: bool = False
@@ -328,15 +330,17 @@ class MoETransformerObserver(BaseTransformerObserver):
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
-            if not len(output) >= 2:
-                raise ValueError(
-                    f"Expected output of module {module.__class__.__name__} at layer "
-                    f"{layer_number} to be a tuple of at least length 2, got {len(output)}."
-                )
+            if not self.hook_config.compute_router_logits_from_input:
+                if not isinstance(output, tuple) or len(output) < 2:
+                    raise ValueError(
+                        f"Expected output of module {module.__class__.__name__} at layer "
+                        f"{layer_number} to be a tuple of at least length 2, got {type(output)}."
+                    )
             input = args[0]  # (batch_size, seq_len, hidden_dim)
             device = input.device
             if layer_number not in self.state:
-                self.state[layer_number] = self._initialize_state(output, num_experts)
+                init_output = output if isinstance(output, tuple) else (output,)
+                self.state[layer_number] = self._initialize_state(init_output, num_experts)
             batch_size, sequence_length, hidden_dim = input.shape
             flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
 
@@ -350,7 +354,29 @@ class MoETransformerObserver(BaseTransformerObserver):
 
             activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
-            if self.hook_config.fused_experts:
+            if self.hook_config.compute_router_logits_from_input:
+                router_module = getattr(module, "gate", None) or getattr(
+                    module, "router", None
+                )
+                if router_module is None:
+                    raise ValueError(
+                        f"No gate/router on {module.__class__.__name__} at layer {layer_number}"
+                    )
+                router_logits = router_module(flat_input)
+                if router_logits.dim() == 1:
+                    router_logits = router_logits.view(-1, num_experts)
+                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                experts_mod = module.experts
+                for idx in range(num_experts):
+                    gate, up = torch.nn.functional.linear(
+                        flat_input, experts_mod.gate_up_proj[idx]
+                    ).chunk(2, dim=-1)
+                    hidden = experts_mod.act_fn(gate) * up
+                    activations[idx] = torch.nn.functional.linear(
+                        hidden, experts_mod.down_proj[idx]
+                    ).to(device)
+
+            elif self.hook_config.fused_experts:
                 _, router_scores = output  # (num_experts, total_tokens)
                 router_logits = module.router(flat_input)  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
@@ -524,6 +550,16 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
     fused_experts: bool = False
 
 
+@dataclass
+class GlmMoeDsaObserverHookConfig(MoETransformerObserverConfig):
+    module_class_name_to_hook_regex: Optional[str] = "GlmMoeDsaMoE"
+    num_experts_attr_name: str = "config.n_routed_experts"
+    top_k_attr_name: str = "config.num_experts_per_tok"
+    fused_experts: bool = False
+    compute_router_logits_from_input: bool = True
+    naive_expert_tensors: bool = True
+
+
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
@@ -533,4 +569,5 @@ OBSERVER_CONFIG_REGISTRY = {
     "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
+    "GlmMoeDsaForCausalLM": GlmMoeDsaObserverHookConfig,
 }

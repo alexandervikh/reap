@@ -26,3 +26,6 @@ pruning_env_5/
 credentials.json
 config/wildbench_prod_env_*
 cmd.sh
+.pydeps/**
+data/** 
+.cursor/**

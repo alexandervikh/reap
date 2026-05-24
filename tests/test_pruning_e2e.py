@@ -9,6 +9,8 @@ from transformers import (
     DeepseekV2Config,
     Ernie4_5_MoeConfig,
     Glm4MoeConfig,
+    GlmMoeDsaConfig,
+    GlmMoeDsaForCausalLM,
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
 )
@@ -71,6 +73,36 @@ def _make_qwen3_model():
             num_key_value_heads=1,
             num_experts=3,
             num_experts_per_tok=1,
+            norm_topk_prob=False,
+        )
+    )
+    model.eval()
+    return model
+
+
+def _make_glm_moe_dsa_model():
+    model = GlmMoeDsaForCausalLM(
+        GlmMoeDsaConfig(
+            vocab_size=32,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=3,
+            mlp_layer_types=["dense", "dense", "sparse"],
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=4,
+            num_experts_per_tok=1,
+            n_shared_experts=1,
+            q_lora_rank=16,
+            kv_lora_rank=16,
+            qk_nope_head_dim=12,
+            qk_rope_head_dim=4,
+            v_head_dim=16,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            indexer_types=["full", "full", "full"],
             norm_topk_prob=False,
         )
     )
@@ -197,6 +229,11 @@ def _expert_count_for_layer(model, layer_idx):
     experts = getattr(moe, model_attrs["experts"])
     if isinstance(experts, torch.nn.ModuleList):
         return len(experts)
+    if hasattr(experts, "num_experts"):
+        return experts.num_experts
+    num_experts_attr = model_attrs.get("num_experts")
+    if num_experts_attr and hasattr(moe, num_experts_attr):
+        return getattr(moe, num_experts_attr)
     return moe.num_experts
 
 
@@ -251,6 +288,11 @@ ARCHITECTURE_CASES = [
         _make_ernie_model,
         _make_mock_batches,
         id="ernie-local",
+    ),
+    pytest.param(
+        _make_glm_moe_dsa_model,
+        _make_mock_batches,
+        id="glm-5.1",
     ),
 ]
 

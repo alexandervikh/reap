@@ -46,7 +46,12 @@ echo "Evaluations: lm_eval: $run_lm_eval, evalplus: $run_evalplus, livecodebench
 echo "Using seed: $seed"
 
 echo "Running with model: $model_name, dataset: $dataset_name, compression ratio: $compression_ratio, pruning method: $pruning_method"
-python -m reap.layerwise_prune \
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON="${REPO_ROOT}/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+  PYTHON=python
+fi
+"$PYTHON" -m reap.layerwise_prune \
     --model-name $model_name \
     --dataset-name $dataset_name \
     --compression-ratio $compression_ratio \
