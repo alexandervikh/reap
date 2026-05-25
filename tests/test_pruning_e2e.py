@@ -11,6 +11,8 @@ from transformers import (
     Glm4MoeConfig,
     GlmMoeDsaConfig,
     GlmMoeDsaForCausalLM,
+    Llama4ForCausalLM,
+    Llama4TextConfig,
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
 )
@@ -123,6 +125,7 @@ def _make_glm_model():
             n_routed_experts=3,
             num_experts_per_tok=1,
             norm_topk_prob=False,
+            rope_scaling={"rope_type": "linear", "factor": 1.0},
         )
     )
     model.eval()
@@ -231,6 +234,9 @@ def _expert_count_for_layer(model, layer_idx):
         return len(experts)
     if hasattr(experts, "num_experts"):
         return experts.num_experts
+    moe_num_experts_attr = model_attrs.get("moe_num_experts")
+    if moe_num_experts_attr and hasattr(moe, moe_num_experts_attr):
+        return getattr(moe, moe_num_experts_attr)
     num_experts_attr = model_attrs.get("num_experts")
     if num_experts_attr and hasattr(moe, num_experts_attr):
         return getattr(moe, num_experts_attr)
@@ -241,7 +247,13 @@ def _router_out_features_for_layer(model, layer_idx):
     moe = get_moe(model, layer_idx)
     model_attrs = MODEL_ATTRS[model.__class__.__name__]
     router = getattr(moe, model_attrs["router"])
-    return router.out_features
+    if hasattr(router, "out_features"):
+        return router.out_features
+    if hasattr(router, "weight") and router.weight is not None:
+        return router.weight.shape[0]
+    if hasattr(router, "e_score_correction_bias"):
+        return router.e_score_correction_bias.shape[-1]
+    return router.n_routed_experts
 
 
 def _assert_prune_result(observer_data, pruned_model, n_experts_to_prune):
@@ -351,3 +363,84 @@ def test_e2e_layerwise_pruning_functionality(model_factory, batch_factory, tmp_p
     _assert_prune_result(
         layerwise_observer_data, layerwise_prune_model, n_experts_to_prune
     )
+
+
+def _make_llama4_model():
+    model = Llama4ForCausalLM(
+        Llama4TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            intermediate_size_mlp=32,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            num_local_experts=2,
+            num_experts_per_tok=1,
+            layer_types=["full_attention", "full_attention", "full_attention"],
+        )
+    )
+    model.eval()
+    return model
+
+
+def test_glm_moe_dsa_fused_expert_count_attrs(tmp_path):
+    """GlmMoeDsa fused prune updates n_routed_experts on the MoE block, not num_experts."""
+    torch.manual_seed(0)
+    model = _make_glm_moe_dsa_model()
+    observer_data = {
+        2: {
+            "expert_frequency": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+            "total_tokens": torch.tensor(10.0),
+            "reap": torch.tensor([4.0, 3.0, 2.0, 1.0]),
+        }
+    }
+    pruned_dir, n_experts_to_prune = _run_prune(
+        observer_data=observer_data,
+        model=model,
+        tmp_path=tmp_path,
+        subdir_name="glm_moe_dsa_fused_counts",
+    )
+    assert pruned_dir.exists()
+    expected = 4 - n_experts_to_prune
+    assert model.config.n_routed_experts == expected
+    moe = get_moe(model, 2)
+    assert moe.n_routed_experts == expected
+    assert moe.experts.num_experts == expected
+    assert moe.gate.n_routed_experts == expected
+    assert not hasattr(moe, "num_experts")
+
+
+def test_fused_prune_without_experts_num_experts_attribute(tmp_path):
+    """Fused prune must not require experts.num_experts (Llama-4 uses moe.num_experts)."""
+    torch.manual_seed(0)
+    model = _make_llama4_model()
+    observer_data = {
+        layer_idx: {
+            "expert_frequency": torch.tensor([1.0, 2.0]),
+            "total_tokens": torch.tensor(10.0),
+        }
+        for layer_idx in range(model.config.num_hidden_layers)
+    }
+    for layer_idx in observer_data:
+        moe = get_moe(model, layer_idx)
+        assert hasattr(moe.experts, "num_experts")
+        assert hasattr(moe, "num_experts")
+        delattr(moe.experts, "num_experts")
+
+    pruned_dir, n_experts_to_prune = _run_prune(
+        observer_data=observer_data,
+        model=model,
+        tmp_path=tmp_path,
+        subdir_name="llama4_fused_no_experts_num_experts",
+    )
+    assert pruned_dir.exists()
+    _assert_prune_result(observer_data, model, n_experts_to_prune)
+    expected = 2 - n_experts_to_prune
+    assert model.config.num_local_experts == expected
+    for layer_idx in observer_data:
+        moe = get_moe(model, layer_idx)
+        assert moe.num_experts == expected
+        assert moe.router.num_experts == expected
+        assert not hasattr(moe, "num_local_experts")
+        assert not hasattr(moe.experts, "num_experts")
