@@ -26,6 +26,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def fused_expert_weight_for_observer(
+    weight: torch.Tensor, compute_dtype: torch.dtype
+) -> torch.Tensor:
+    """Cast fused expert weights to activation dtype for observer matmuls.
+
+    FP8 checkpoints cannot use ``F.linear`` on Float8 weights directly; REAP
+    observer runs matmuls in the activation dtype (typically BF16).
+    """
+    if weight.dtype != compute_dtype:
+        return weight.to(compute_dtype)
+    return weight
+
+
 class BaseTransformerObserverHookConfig:
     state_attr_name: str = "hook_state"
     hook_attr_name: str = "hooks"
@@ -367,14 +380,21 @@ class MoETransformerObserver(BaseTransformerObserver):
                     router_logits = router_logits.view(-1, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                 experts_mod = module.experts
+                compute_dtype = flat_input.dtype
                 for idx in range(num_experts):
-                    gate, up = torch.nn.functional.linear(
-                        flat_input, experts_mod.gate_up_proj[idx]
-                    ).chunk(2, dim=-1)
+                    gate_up = fused_expert_weight_for_observer(
+                        experts_mod.gate_up_proj[idx], compute_dtype
+                    )
+                    gate, up = torch.nn.functional.linear(flat_input, gate_up).chunk(
+                        2, dim=-1
+                    )
                     hidden = experts_mod.act_fn(gate) * up
-                    activations[idx] = torch.nn.functional.linear(
-                        hidden, experts_mod.down_proj[idx]
-                    ).to(device)
+                    down = fused_expert_weight_for_observer(
+                        experts_mod.down_proj[idx], compute_dtype
+                    )
+                    activations[idx] = torch.nn.functional.linear(hidden, down).to(
+                        device
+                    )
 
             elif self.hook_config.fused_experts:
                 _, router_scores = output  # (num_experts, total_tokens)
@@ -418,6 +438,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                 valid_token_mask=flat_mask,
                 renormalize_router_weights=self.hook_config.renormalize_router_weights,
             )
+            del activations
 
             # Merging critera
             if not self.hook_config.record_pruning_metrics_only:
@@ -492,7 +513,6 @@ class MoETransformerObserver(BaseTransformerObserver):
 
             # --- CLEAN UP -------------------------------------------------------------
             del (
-                activations,
                 selected_experts,
                 router_logits,
                 pruning_batch,

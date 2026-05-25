@@ -78,19 +78,24 @@ def _prepare_pruning_batch(
     mask, validates the resulting shapes, and precomputes token counts and routing
     frequencies needed by downstream pruning updates.
     """
-    device = activations.device
-    selected_experts = selected_experts.reshape(-1, selected_experts.shape[-1]).to(device)
-    router_logits = router_logits.to(device)
-
-    # Filter out padding tokens if attention mask is provided
     if valid_token_mask is not None:
-        valid_token_mask = valid_token_mask.reshape(-1).bool().to(device)
-        # Filter activations: (num_experts, total_tokens, hidden_dim) -> (num_experts, num_valid_tokens, hidden_dim)
-        activations = activations[:, valid_token_mask, :]
-        # Filter selected_experts: (total_tokens, top_k) -> (num_valid_tokens, top_k)
-        selected_experts = selected_experts[valid_token_mask]
-        # Filter router_logits: (total_tokens, num_experts) -> (num_valid_tokens, num_experts)
-        router_logits = router_logits[valid_token_mask]
+        # Index on CPU so we do not allocate a second large
+        # [num_experts, total_tokens, hidden_dim] tensor on GPU (GLM-scale MoE).
+        valid = valid_token_mask.reshape(-1).bool()
+        if valid.device.type != "cpu":
+            valid = valid.cpu()
+        activations = activations.detach().cpu()[:, valid, :]
+        selected_experts = (
+            selected_experts.reshape(-1, selected_experts.shape[-1]).detach().cpu()[valid]
+        )
+        router_logits = router_logits.detach().cpu()[valid]
+        device = activations.device
+    else:
+        device = activations.device
+        selected_experts = selected_experts.reshape(
+            -1, selected_experts.shape[-1]
+        ).to(device)
+        router_logits = router_logits.to(device)
 
     if activations.shape[0] != num_experts:
         raise ValueError(

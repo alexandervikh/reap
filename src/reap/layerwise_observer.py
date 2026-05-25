@@ -27,6 +27,7 @@ from transformers.tokenization_utils_base import BatchEncoding
 
 from reap.observer import (
     MoETransformerObserverConfig,
+    fused_expert_weight_for_observer,
 )
 from reap.layerwise_model_utils import (
     extract_model_components,
@@ -675,14 +676,17 @@ class LayerwiseMoEObserver:
                 router_logits = router_logits.view(-1, num_experts)
             _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
             experts_mod = moe_module.experts
+            compute_dtype = flat_input.dtype
             for idx in range(num_experts):
-                gate, up = torch.nn.functional.linear(
-                    flat_input, experts_mod.gate_up_proj[idx]
-                ).chunk(2, dim=-1)
+                gate_up = fused_expert_weight_for_observer(
+                    experts_mod.gate_up_proj[idx], compute_dtype
+                )
+                gate, up = torch.nn.functional.linear(flat_input, gate_up).chunk(2, dim=-1)
                 hidden = experts_mod.act_fn(gate) * up
-                activations[idx] = torch.nn.functional.linear(
-                    hidden, experts_mod.down_proj[idx]
-                ).to(device)
+                down = fused_expert_weight_for_observer(
+                    experts_mod.down_proj[idx], compute_dtype
+                )
+                activations[idx] = torch.nn.functional.linear(hidden, down).to(device)
         elif self.hook_config.fused_experts:
             # Fused experts (e.g., Llama-4)
             router_logits = extract_router_logits(moe_module.router, flat_input)
@@ -720,14 +724,21 @@ class LayerwiseMoEObserver:
             # Compute activations for all experts
             if getattr(self.hook_config, "naive_expert_tensors", False):
                 experts_mod = moe_module.experts
+                compute_dtype = flat_input.dtype
                 for idx in range(num_experts):
-                    gate, up = torch.nn.functional.linear(
-                        flat_input, experts_mod.gate_up_proj[idx]
-                    ).chunk(2, dim=-1)
+                    gate_up = fused_expert_weight_for_observer(
+                        experts_mod.gate_up_proj[idx], compute_dtype
+                    )
+                    gate, up = torch.nn.functional.linear(flat_input, gate_up).chunk(
+                        2, dim=-1
+                    )
                     hidden = experts_mod.act_fn(gate) * up
-                    activations[idx] = torch.nn.functional.linear(
-                        hidden, experts_mod.down_proj[idx]
-                    ).to(device)
+                    down = fused_expert_weight_for_observer(
+                        experts_mod.down_proj[idx], compute_dtype
+                    )
+                    activations[idx] = torch.nn.functional.linear(hidden, down).to(
+                        device
+                    )
             else:
                 for idx, expert in enumerate(moe_module.experts):
                     activations[idx] = expert(flat_input).to(device)

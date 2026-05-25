@@ -44,7 +44,12 @@ from reap.args import (
     LayerwiseArgs,
 )
 from reap.data import load_category_batches, parse_composite_dataset_spec
-from reap.model_util import patched_model_map
+from reap.model_util import (
+    dispatch_model_to_auto,
+    get_from_pretrained_kwargs,
+    model_weights_all_on_cpu,
+    patched_model_map,
+)
 from reap.observer import OBSERVER_CONFIG_REGISTRY
 from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.layerwise_model_utils import cleanup_memory
@@ -277,14 +282,17 @@ def main():
         logger.info("Preparing calibration samples...")
         data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
 
-        # Load model on CPU for layerwise processing
-        logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
+        load_map = layerwise_args.load_device_map
+        logger.info(
+            f"Loading model {model_name} (device_map={load_map!r}) for layerwise processing..."
+        )
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="cpu",
-            torch_dtype="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
+            **get_from_pretrained_kwargs(
+                device_map=load_map,
+                local_files_only=pathlib.Path(model_name).exists(),
+                low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
+            ),
         )
         model.eval()
 
@@ -354,19 +362,47 @@ def main():
             f"Pruned model already exists at {pruned_model_dir}. Skipping pruning."
         )
     else:
-        # Reload model on auto device for pruning
-        logger.info("Reloading model on GPU for pruning...")
-        if model is not None:
-            del model
-        cleanup_memory()
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype="auto",
-            trust_remote_code=True,
-            local_files_only=True,
-        )
+        if layerwise_args.prune_on_cpu:
+            if model is None:
+                logger.info("Loading model on CPU for pruning...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    **get_from_pretrained_kwargs(
+                        device_map="cpu",
+                        local_files_only=pathlib.Path(model_name).exists(),
+                        low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
+                    ),
+                )
+            else:
+                logger.info(
+                    "Pruning on CPU using model from layerwise observer "
+                    "(skipping GPU reload)."
+                )
+        else:
+            local_only = pathlib.Path(model_name).exists()
+            if model is not None:
+                if model_weights_all_on_cpu(model):
+                    logger.info(
+                        "Dispatching in-memory model to GPUs for pruning "
+                        "(skipping second from_pretrained reload)."
+                    )
+                    cleanup_memory()
+                    model = dispatch_model_to_auto(model)
+                else:
+                    logger.info(
+                        "Pruning on GPU using sharded model from layerwise observer "
+                        "(no reload)."
+                    )
+            else:
+                logger.info("Loading model on GPU for pruning...")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    **get_from_pretrained_kwargs(
+                        device_map="auto",
+                        local_files_only=local_only,
+                        low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
+                    ),
+                )
 
         # Prune
         logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")

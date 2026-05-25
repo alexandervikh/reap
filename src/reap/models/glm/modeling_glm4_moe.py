@@ -436,7 +436,16 @@ class Glm4MoeRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        rope_type = self.rope_type
+        if rope_type not in ROPE_INIT_FUNCTIONS:
+            rope_type = "linear"
+            if not hasattr(config, "rope_scaling") or not isinstance(
+                getattr(config, "rope_scaling", None), dict
+            ):
+                config.rope_scaling = {"rope_type": "linear", "factor": 1.0}
+            elif "factor" not in config.rope_scaling:
+                config.rope_scaling = {**config.rope_scaling, "factor": 1.0}
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -511,9 +520,8 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
 
         causal_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -541,7 +549,7 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
 
 @auto_docstring
 class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 

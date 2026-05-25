@@ -562,6 +562,29 @@ class LayerwiseArgs:
             )
         },
     )
+    prune_on_cpu: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Prune and save on CPU. If false (default for multi-GPU), reuse the "
+                "in-memory model and dispatch to GPUs without a second from_pretrained "
+                "reload (avoids load-time OOM on fused MoE checkpoints). Set true only "
+                "when GPU dispatch is unavailable or RAM-only nodes."
+            )
+        },
+    )
+    load_device_map: str = field(
+        default="cpu",
+        metadata={
+            "help": (
+                "device_map for the initial from_pretrained load. Use 'auto' on "
+                "multi-GPU nodes to load ~5x faster (parallel shard placement); "
+                "layerwise replay still moves one block to GPU at a time. 'cpu' "
+                "keeps the full checkpoint in RAM (slow for 700GB+ models)."
+            ),
+            "choices": ["cpu", "auto"],
+        },
+    )
 
     
 @dataclass

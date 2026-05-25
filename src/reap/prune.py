@@ -32,12 +32,89 @@ from reap.cluster import (
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import (
+    get_moe,
+    assert_merge,
+    MODEL_ATTRS,
+    patched_model_map,
+    get_super_expert_indices,
+    get_from_pretrained_kwargs,
+    get_model_device,
+)
 from reap.eval import run_evaluate
 import shutil
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+def _expert_count_attr_names(model_attrs: dict[str, Any]) -> list[str]:
+    """Ordered unique MODEL_ATTRS names for runtime expert-count fields."""
+    names: list[str] = []
+    for key in ("moe_num_experts", "num_experts", "fused_experts_count"):
+        attr = model_attrs.get(key)
+        if attr and attr not in names:
+            names.append(attr)
+    return names
+
+
+def _set_module_expert_counts(
+    module: Any,
+    model_attrs: dict[str, Any],
+    retained_count: int,
+    *,
+    required_attrs: tuple[str, ...] = (),
+) -> None:
+    """Set every mapped expert-count attribute present on ``module``."""
+    for attr in _expert_count_attr_names(model_attrs):
+        if hasattr(module, attr):
+            setattr(module, attr, retained_count)
+    for attr in required_attrs:
+        if not hasattr(module, attr):
+            raise AttributeError(
+                f"{module.__class__.__name__} missing required expert-count "
+                f"attribute {attr!r} (MODEL_ATTRS)"
+            )
+        setattr(module, attr, retained_count)
+
+
+def _set_fused_expert_counts(moe, model_attrs: dict[str, Any], retained_count: int) -> None:
+    """Update fused MoE expert counts using MODEL_ATTRS only.
+
+    ``model_attrs["num_experts"]`` is the HuggingFace **config** key (also applied to
+    ``model.config`` after pruning). The MoE block and experts submodule may use
+    different runtime names (e.g. Llama-4 config ``num_local_experts`` vs
+    ``moe.num_experts``; GLM config ``n_routed_experts`` vs ``experts.num_experts``).
+    """
+    if not model_attrs.get("moe_num_experts"):
+        raise KeyError(
+            "Fused MoE models require MODEL_ATTRS['moe_num_experts'] "
+            f"(missing for {moe.__class__.__name__})"
+        )
+
+    experts = moe.experts
+    experts_attrs: list[str] = []
+    if fused_attr := model_attrs.get("fused_experts_count"):
+        experts_attrs.append(fused_attr)
+    for attr in _expert_count_attr_names(model_attrs):
+        if attr not in experts_attrs:
+            experts_attrs.append(attr)
+    for attr in experts_attrs:
+        if hasattr(experts, attr):
+            setattr(experts, attr, retained_count)
+
+    _set_module_expert_counts(
+        moe,
+        model_attrs,
+        retained_count,
+        required_attrs=(model_attrs["moe_num_experts"],),
+    )
+
+
+def _set_fused_router_counts(router: Any, model_attrs: dict[str, Any], retained_count: int) -> None:
+    """Update router/gate expert-count metadata after fused weight pruning."""
+    _set_module_expert_counts(router, model_attrs, retained_count)
+    if hasattr(router, "out_features"):
+        router.out_features = retained_count
 
 
 def prune(
@@ -82,7 +159,9 @@ def prune(
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
         if prune_args.prune_method == "ean_ca":
-            ean = torch.zeros(num_experts, device=model.device, dtype=torch.float32)
+            ean = torch.zeros(
+                num_experts, device=get_model_device(model), dtype=torch.float32
+            )
             for i in range(num_experts):
                 ean[i] = torch.linalg.norm(
                     observer_data[layer]["routed_characteristic_activation"][i], dim=-1
@@ -138,14 +217,21 @@ def prune(
                 retained_expert_indicies
             ]
             moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
-            moe.experts.num_experts = len(retained_expert_indicies)
-            if hasattr(moe, "n_routed_experts"):
-                moe.n_routed_experts = len(retained_expert_indicies)
-            router = getattr(moe, model_attrs["router"])
+            retained_count = len(retained_expert_indicies)
+            _set_fused_expert_counts(moe, model_attrs, retained_count)
+            router_attr = model_attrs["router"]
+            if hasattr(moe, router_attr):
+                router = getattr(moe, router_attr)
+            elif hasattr(moe, "router"):
+                router = moe.router
+            elif hasattr(moe, "gate"):
+                router = moe.gate
+            else:
+                raise AttributeError(
+                    f"No router/gate on {moe.__class__.__name__} (expected '{router_attr}')"
+                )
             router.weight.data = router.weight.data[retained_expert_indicies]
-            router.out_features = len(retained_expert_indicies)
-            if hasattr(router, "num_experts"):
-                router.num_experts = len(retained_expert_indicies)
+            _set_fused_router_counts(router, model_attrs, retained_count)
             if hasattr(router, "e_score_correction_bias"):
                 router.e_score_correction_bias.data = router.e_score_correction_bias.data[
                     retained_expert_indicies
@@ -227,10 +313,10 @@ def main():
     # load model
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=True,
-        local_files_only=True,
+        **get_from_pretrained_kwargs(
+            device_map="auto",
+            local_files_only=pathlib.Path(model_name).exists(),
+        ),
     )
     # record activations or load previously recorded activations
     logger.info(

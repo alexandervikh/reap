@@ -1,7 +1,18 @@
-import torch
+from __future__ import annotations
+
 import logging
+from typing import Any
+
+import torch
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+# CPU spill budget for device_map="auto" (load + dispatch after layerwise observer).
+_AUTO_DEVICE_MAP_CPU_HEADROOM_GIB = 1500
+# Fraction of per-GPU VRAM usable for weights during load/dispatch. Fused MoE
+# checkpoints spike during expert-tensor concat; 0.82 on 140GiB H200 ≈ 115GiB cap.
+_AUTO_DEVICE_MAP_GPU_MEMORY_FRACTION = 0.82
 
 
 MODEL_ATTRS = {
@@ -45,8 +56,10 @@ MODEL_ATTRS = {
         "down_proj": "down_proj",
         "experts": "experts",
         "fused": True,
-        "router": "gate",
-        "num_experts": "num_local_experts",
+        "router": "router",
+        "num_experts": "num_local_experts",  # HuggingFace config field
+        "moe_num_experts": "num_experts",  # Llama4TextMoe / Llama4Router runtime attr
+        "fused_experts_count": "num_experts",  # Llama4TextExperts
         "num_experts_per_tok": "num_experts_per_tok",
     },
     "MixtralForCausalLM": {
@@ -123,10 +136,117 @@ MODEL_ATTRS = {
         "experts": "experts",
         "fused": True,
         "router": "gate",
-        "num_experts": "n_routed_experts",
+        "num_experts": "n_routed_experts",  # HuggingFace config field
+        "moe_num_experts": "n_routed_experts",  # GlmMoeDsaMoE / GlmMoeDsaTopkRouter
+        "fused_experts_count": "num_experts",  # GlmMoeDsaNaiveMoe (config.num_local_experts alias)
         "num_experts_per_tok": "num_experts_per_tok",
     },
 }
+
+
+def build_auto_max_memory(
+    gpu_memory_fraction: float = _AUTO_DEVICE_MAP_GPU_MEMORY_FRACTION,
+) -> dict[int | str, str]:
+    """Per-device max_memory dict for accelerate / HF device_map='auto'."""
+    max_memory: dict[int | str, str] = {}
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            total_gib = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+            cap_gib = max(1, int(total_gib * gpu_memory_fraction))
+            max_memory[i] = f"{cap_gib}GiB"
+    max_memory["cpu"] = f"{_AUTO_DEVICE_MAP_CPU_HEADROOM_GIB}GiB"
+    return max_memory
+
+
+def get_model_device(model: nn.Module) -> torch.device:
+    """Resolve a device for tensors when ``model.device`` is absent (sharded models)."""
+    if hasattr(model, "device"):
+        return model.device
+    hf_map = getattr(model, "hf_device_map", None)
+    if hf_map:
+        for dev in hf_map.values():
+            if isinstance(dev, int):
+                return torch.device(f"cuda:{dev}")
+            if isinstance(dev, str) and dev.startswith("cuda"):
+                return torch.device(dev)
+    return next(model.parameters()).device
+
+
+def get_model_input_device(model: nn.Module) -> torch.device:
+    """Device for calibration batch tensors (embedding shard for ``device_map`` models)."""
+    try:
+        embed = model.get_input_embeddings()
+        if embed is not None and hasattr(embed, "weight"):
+            weight = embed.weight
+            if str(weight.device) != "meta":
+                return weight.device
+    except Exception:
+        pass
+    return get_model_device(model)
+
+
+def model_weights_all_on_cpu(model: nn.Module) -> bool:
+    for param in model.parameters():
+        if str(param.device) == "meta":
+            continue
+        if param.device.type != "cpu":
+            return False
+    return True
+
+
+def dispatch_model_to_auto(
+    model: nn.Module,
+    gpu_memory_fraction: float = _AUTO_DEVICE_MAP_GPU_MEMORY_FRACTION,
+) -> nn.Module:
+    """Spread an in-memory (CPU) model across GPUs without reloading from disk."""
+    from accelerate import dispatch_model, infer_auto_device_map
+    from accelerate.hooks import remove_hook_from_submodules
+
+    if not torch.cuda.is_available():
+        return model
+
+    try:
+        remove_hook_from_submodules(model)
+    except Exception:
+        pass
+
+    max_memory = build_auto_max_memory(gpu_memory_fraction)
+    infer_kwargs: dict[str, Any] = {"max_memory": max_memory}
+    no_split = getattr(model, "_no_split_modules", None)
+    if no_split:
+        infer_kwargs["no_split_module_classes"] = no_split
+
+    device_map = infer_auto_device_map(model, **infer_kwargs)
+    logger.info(
+        "Dispatching model to GPUs for prune (max_memory per GPU: %s)",
+        {k: v for k, v in max_memory.items() if k != "cpu"},
+    )
+    return dispatch_model(model, device_map=device_map)
+
+
+def get_from_pretrained_kwargs(
+    *,
+    device_map: str = "auto",
+    local_files_only: bool = False,
+    low_cpu_mem_usage: bool | None = None,
+    gpu_memory_fraction: float = _AUTO_DEVICE_MAP_GPU_MEMORY_FRACTION,
+) -> dict[str, Any]:
+    """Build kwargs for ``AutoModelForCausalLM.from_pretrained``."""
+    kwargs: dict[str, Any] = {
+        "torch_dtype": "auto",
+        "trust_remote_code": True,
+    }
+    if local_files_only:
+        kwargs["local_files_only"] = True
+    if low_cpu_mem_usage is not None:
+        kwargs["low_cpu_mem_usage"] = low_cpu_mem_usage
+
+    if device_map == "auto" and torch.cuda.is_available():
+        kwargs["device_map"] = "auto"
+        kwargs["max_memory"] = build_auto_max_memory(gpu_memory_fraction)
+    else:
+        kwargs["device_map"] = device_map
+    return kwargs
 
 
 def get_moe(model, layer):
@@ -204,6 +324,14 @@ def patched_model_map(model: str):
     if model == "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8":
         patched = True
         model_name = "artifacts/models/Qwen3-Coder-480B-A35B-Instruct-FP8"
+
+    if model in ("zai-org/GLM-5.1-FP8", "GLM-5.1-FP8"):
+        patched = True
+        model_name = "artifacts/models/GLM-5.1-FP8"
+
+    if model in ("zai-org/GLM-5.1", "GLM-5.1"):
+        patched = True
+        model_name = "artifacts/models/GLM-5.1"
 
     if patched:
         logger.info(f"Using patched model for {model} from: {model_name}")
