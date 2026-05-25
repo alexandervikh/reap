@@ -518,6 +518,8 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        # transformers>=5.4: create_causal_mask no longer accepts cache_position
+        # (deprecated in masking_utils). cache_position above is only for position_ids.
         causal_mask = create_causal_mask(
             config=self.config,
             inputs_embeds=inputs_embeds,
