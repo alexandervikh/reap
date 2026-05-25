@@ -84,12 +84,17 @@ Add model attribute names to `MODEL_ATTRS` in `src/reap/model_util.py`. Each ent
 
 Requires `transformers>=5.4.0` (in-tree `glm_moe_dsa`). MoE uses fused expert tensors and a `gate` router with `e_score_correction_bias`; observer hooks compute router logits from `module.gate(flat_input)`.
 
-**Phase B (dev, FP8):** download + layerwise prune + optional HF lm-eval smoke:
+**Phase B (dev, FP8):** paper-style monolithic calibration (recommended, same as GLM-4.5):
 
 ```bash
 python scripts/patch_glm_5_1.py
-bash scripts/glm_5_1_phase_b.sh
+SMOKE=true bash scripts/glm_5_1_monolithic.sh   # 2 batches, observer-only
+SMOKE=false bash scripts/glm_5_1_monolithic.sh  # 128 batches + prune
 ```
+
+Uses `src/reap/prune.py` with `batch_size=1`, `device_map=auto`, and standard MoE hooks (no layerwise replay).
+
+**Phase B (alt, layerwise):** `bash scripts/glm_5_1_phase_b.sh` — block replay for single-GPU / RAM-heavy fallback.
 
 Or directly: `bash experiments/pruning-layerwise-cli.sh 0 zai-org/GLM-5.1-FP8 reap 42 0.25 theblackcat102/evol-codealpaca-v1 false false false false false`
 

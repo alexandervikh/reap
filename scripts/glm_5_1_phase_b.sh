@@ -29,7 +29,13 @@ SEED="${SEED:-42}"
 COMPRESSION="${COMPRESSION:-0.25}"
 DATASET="${DATASET:-theblackcat102/evol-codealpaca-v1}"
 
-echo "Phase B: layerwise REAP prune (128 batches, no eval)"
+# Multi-GPU load (~15–20 min) vs CPU load (~80+ min). prune_on_cpu=false re-dispatches
+# the in-memory model to GPUs after observer (no second from_pretrained / OOM reload).
+LOAD_DEVICE_MAP="${LOAD_DEVICE_MAP:-auto}"
+PRUNE_ON_CPU="${PRUNE_ON_CPU:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+echo "Phase B: layerwise REAP prune (load_device_map=${LOAD_DEVICE_MAP}, prune_on_cpu=${PRUNE_ON_CPU})"
 "$PYTHON" -m reap.layerwise_prune \
   --model-name "$MODEL" \
   --dataset-name "$DATASET" \
@@ -41,6 +47,8 @@ echo "Phase B: layerwise REAP prune (128 batches, no eval)"
   --batches_per_category 128 \
   --batch_size 8 \
   --low_cpu_mem_usage True \
+  --load_device_map "$LOAD_DEVICE_MAP" \
+  --prune_on_cpu "$PRUNE_ON_CPU" \
   2>&1 | tee artifacts/glm_5_1_layerwise_prune.log
 
 if [[ "$MODEL" == *"GLM-5.1-FP8"* ]]; then
@@ -48,7 +56,7 @@ if [[ "$MODEL" == *"GLM-5.1-FP8"* ]]; then
 else
   SHORT_MODEL="zai-org_GLM-5.1-FP8"
 fi
-PRUNED_DIR="artifacts/${SHORT_MODEL}/theblackcat102_evol-codealpaca-v1/pruned_models/layerwise_reap-renorm_true-seed_${SEED}-${COMPRESSION}"
+PRUNED_DIR="artifacts/${SHORT_MODEL}/evol-codealpaca-v1/pruned_models/layerwise_reap-renorm_true-seed_${SEED}-${COMPRESSION}"
 
 echo "Phase B: manual HF lm-eval smoke (limit 200; slow at 744B scale)"
 if [[ -d "$PRUNED_DIR" ]]; then
