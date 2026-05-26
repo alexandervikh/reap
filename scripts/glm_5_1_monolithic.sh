@@ -13,30 +13,36 @@ if [[ ! -x "$PYTHON" ]]; then
   PYTHON=python
 fi
 
-if [[ ! -d "${REPO_ROOT}/artifacts/models/GLM-5.1-FP8" ]]; then
+MODEL="${MODEL:-zai-org/GLM-5.1-FP8}"
+if [[ "$MODEL" == *"GLM-5.1-FP8"* ]] && [[ ! -d "${REPO_ROOT}/artifacts/models/GLM-5.1-FP8" ]]; then
   "$PYTHON" scripts/patch_glm_5_1.py
 fi
-
-if [[ -d "${REPO_ROOT}/artifacts/models/GLM-5.1-FP8" ]]; then
-  MODEL="${MODEL:-${REPO_ROOT}/artifacts/models/GLM-5.1-FP8}"
-else
-  MODEL="${MODEL:-zai-org/GLM-5.1-FP8}"
+if [[ -d "${REPO_ROOT}/artifacts/models/GLM-5.1-FP8" ]] && [[ "$MODEL" == *"GLM-5.1-FP8"* ]]; then
+  MODEL="${REPO_ROOT}/artifacts/models/GLM-5.1-FP8"
 fi
 
 SEED="${SEED:-42}"
 COMPRESSION="${COMPRESSION:-0.25}"
-DATASET="${DATASET:-theblackcat102/evol-codealpaca-v1}"
+DATASET="${DATASET:-${COMPOSITE_DATASET:-theblackcat102/evol-codealpaca-v1}}"
 SMOKE="${SMOKE:-true}"
 
+export HF_HOME="${HF_HOME:-/tmp/hf}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME}"
+export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 if [[ "$SMOKE" == "true" ]]; then
+  # FP8 (~750GB) requires multi-GPU device_map even for 2-batch smoke.
+  if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] || [[ "$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)" -lt 2 ]]; then
+    echo "SMOKE: defaulting CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 (FP8 needs multi-GPU load)"
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+  fi
   BATCHES=2
   RUN_OBSERVER_ONLY="true"
   MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-512}"
   LOG="${LOG:-artifacts/glm_5_1_monolithic_smoke.log}"
   OUT_NAME="observations_smoke_cosine-seed_${SEED}.pt"
-  echo "Monolithic smoke: ${BATCHES} batches, batch_size=1, model_max_length=${MODEL_MAX_LENGTH}, observer-only"
+  echo "Monolithic smoke: ${BATCHES} batches, batch_size=1, model_max_length=${MODEL_MAX_LENGTH}, observer-only, GPUs=${CUDA_VISIBLE_DEVICES}"
 else
   MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-2048}"
   BATCHES="${BATCHES:-128}"
@@ -61,5 +67,5 @@ fi
   --batches_per_category "$BATCHES" \
   --record_pruning_metrics_only true \
   --run_observer_only "$RUN_OBSERVER_ONLY" \
-  --overwrite_observations true \
+  --overwrite_observations "${OVERWRITE_OBSERVATIONS:-true}" \
   2>&1 | tee "$LOG"
