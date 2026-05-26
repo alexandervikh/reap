@@ -8,6 +8,9 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+# Router hidden-state layout for calibration hooks: 2 = [tokens, hidden], 3 = [batch, seq, hidden].
+ROUTER_INPUT_NDIM_DEFAULT = 2
+
 # CPU spill budget for device_map="auto" (load + dispatch after layerwise observer).
 _AUTO_DEVICE_MAP_CPU_HEADROOM_GIB = 1500
 # Fraction of per-GPU VRAM usable for weights during load/dispatch. Fused MoE
@@ -81,6 +84,7 @@ MODEL_ATTRS = {
         "experts": "experts",
         "fused": False,
         "router": "gate",
+        "router_input_ndim": 3,
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
@@ -136,6 +140,7 @@ MODEL_ATTRS = {
         "experts": "experts",
         "fused": True,
         "router": "gate",
+        "router_input_ndim": 2,
         "num_experts": "n_routed_experts",  # HuggingFace config field
         "moe_num_experts": "n_routed_experts",  # GlmMoeDsaMoE / GlmMoeDsaTopkRouter
         "fused_experts_count": "num_experts",  # GlmMoeDsaNaiveMoe (config.num_local_experts alias)
@@ -170,6 +175,35 @@ def get_model_device(model: nn.Module) -> torch.device:
             if isinstance(dev, str) and dev.startswith("cuda"):
                 return torch.device(dev)
     return next(model.parameters()).device
+
+
+def router_hidden_input_for_model(
+    model: nn.Module,
+    flat_input: torch.Tensor,
+    *,
+    batch_size: int,
+    sequence_length: int,
+    hidden_dim: int,
+) -> torch.Tensor:
+    """Shape hidden states for a model's router/gate (see MODEL_ATTRS router_input_ndim)."""
+    ndim = MODEL_ATTRS.get(model.__class__.__name__, {}).get(
+        "router_input_ndim", ROUTER_INPUT_NDIM_DEFAULT
+    )
+    if ndim == 3:
+        return flat_input.view(batch_size, sequence_length, hidden_dim)
+    if ndim != 2:
+        raise ValueError(
+            f"Unsupported router_input_ndim={ndim!r} for {model.__class__.__name__}"
+        )
+    return flat_input
+
+
+def vllm_supported_for_eval(model_name: str) -> bool:
+    """Whether Phase-A style eval can use a vLLM OpenAI server for this checkpoint."""
+    lower = str(model_name).lower()
+    if "glm-5.1" in lower or "glm_moe_dsa" in lower:
+        return False
+    return True
 
 
 def get_model_input_device(model: nn.Module) -> torch.device:
@@ -230,6 +264,7 @@ def get_from_pretrained_kwargs(
     local_files_only: bool = False,
     low_cpu_mem_usage: bool | None = None,
     gpu_memory_fraction: float = _AUTO_DEVICE_MAP_GPU_MEMORY_FRACTION,
+    dequantize_fp8: bool = False,
 ) -> dict[str, Any]:
     """Build kwargs for ``AutoModelForCausalLM.from_pretrained``."""
     kwargs: dict[str, Any] = {
@@ -238,6 +273,8 @@ def get_from_pretrained_kwargs(
     }
     if local_files_only:
         kwargs["local_files_only"] = True
+    if low_cpu_mem_usage is None and device_map == "auto" and torch.cuda.is_available():
+        low_cpu_mem_usage = True
     if low_cpu_mem_usage is not None:
         kwargs["low_cpu_mem_usage"] = low_cpu_mem_usage
 
@@ -246,7 +283,34 @@ def get_from_pretrained_kwargs(
         kwargs["max_memory"] = build_auto_max_memory(gpu_memory_fraction)
     else:
         kwargs["device_map"] = device_map
+    if dequantize_fp8:
+        kwargs["dtype"] = torch.bfloat16
+        kwargs["_dequantize_fp8_checkpoint"] = True
     return kwargs
+
+
+def maybe_dequantize_fp8_config(model_name: str, load_kwargs: dict[str, Any]) -> None:
+    """Attach ``quantization_config.dequantize=True`` for FP8 checkpoints on Blackwell."""
+    if not load_kwargs.pop("_dequantize_fp8_checkpoint", False):
+        return
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(
+        model_name, trust_remote_code=True, local_files_only=load_kwargs.get("local_files_only", False)
+    )
+    qc = getattr(config, "quantization_config", None)
+    if qc is None:
+        return
+    if isinstance(qc, dict):
+        from transformers import FineGrainedFP8Config
+
+        qc = FineGrainedFP8Config.from_dict({**qc, "dequantize": True})
+    else:
+        qc.dequantize = True
+    load_kwargs["quantization_config"] = qc
+    load_kwargs["dtype"] = torch.bfloat16
+    load_kwargs.pop("torch_dtype", None)
+    logger.info("Loading %s with quantization_config.dequantize=True (BF16 compute)", model_name)
 
 
 def get_moe(model, layer):
