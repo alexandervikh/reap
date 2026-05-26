@@ -27,7 +27,7 @@ from transformers.tokenization_utils_base import BatchEncoding
 
 from reap.observer import (
     MoETransformerObserverConfig,
-    fused_expert_weight_for_observer,
+    naive_moe_expert_activations,
 )
 from reap.layerwise_model_utils import (
     extract_model_components,
@@ -38,6 +38,7 @@ from reap.layerwise_model_utils import (
     safe_get_device,
     has_meta_tensors,
 )
+from reap.model_util import router_hidden_input_for_model
 from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
 from reap.metrics import OnlineStatsTracker
 
@@ -638,22 +639,16 @@ class LayerwiseMoEObserver:
         # Compute activations for all experts
         activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
-        # TODO(ivanl): model-specific handling of router_module return signature
-        def extract_router_logits(router_module, input):
-            """Call routers that expect either flattened or sequence-shaped hidden states.
-
-            DeepSeek's gate unpacks `[batch, seq, hidden]` internally, while other
-            routers accept the flattened `[tokens, hidden]` view used for metric
-            collection. Retry with the original 3D shape when the flat call fails.
-            """
-            try:
-                result = router_module(input)
-            except (TypeError, ValueError):
-                if input.ndim != 2:
-                    raise
-                result = router_module(
-                    input.view(batch_size, sequence_length, hidden_dim)
-                )
+        def extract_router_logits(router_module, flat_hidden: torch.Tensor):
+            """Call router/gate with the hidden layout declared in MODEL_ATTRS."""
+            router_in = router_hidden_input_for_model(
+                self.model,
+                flat_hidden,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                hidden_dim=hidden_dim,
+            )
+            result = router_module(router_in)
             if isinstance(result, tuple):
                 *_, router_logits = result
             else:
@@ -675,18 +670,7 @@ class LayerwiseMoEObserver:
             if router_logits.dim() == 1:
                 router_logits = router_logits.view(-1, num_experts)
             _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-            experts_mod = moe_module.experts
-            compute_dtype = flat_input.dtype
-            for idx in range(num_experts):
-                gate_up = fused_expert_weight_for_observer(
-                    experts_mod.gate_up_proj[idx], compute_dtype
-                )
-                gate, up = torch.nn.functional.linear(flat_input, gate_up).chunk(2, dim=-1)
-                hidden = experts_mod.act_fn(gate) * up
-                down = fused_expert_weight_for_observer(
-                    experts_mod.down_proj[idx], compute_dtype
-                )
-                activations[idx] = torch.nn.functional.linear(hidden, down).to(device)
+            activations = naive_moe_expert_activations(moe_module.experts, flat_input)
         elif self.hook_config.fused_experts:
             # Fused experts (e.g., Llama-4)
             router_logits = extract_router_logits(moe_module.router, flat_input)
@@ -723,22 +707,7 @@ class LayerwiseMoEObserver:
 
             # Compute activations for all experts
             if getattr(self.hook_config, "naive_expert_tensors", False):
-                experts_mod = moe_module.experts
-                compute_dtype = flat_input.dtype
-                for idx in range(num_experts):
-                    gate_up = fused_expert_weight_for_observer(
-                        experts_mod.gate_up_proj[idx], compute_dtype
-                    )
-                    gate, up = torch.nn.functional.linear(flat_input, gate_up).chunk(
-                        2, dim=-1
-                    )
-                    hidden = experts_mod.act_fn(gate) * up
-                    down = fused_expert_weight_for_observer(
-                        experts_mod.down_proj[idx], compute_dtype
-                    )
-                    activations[idx] = torch.nn.functional.linear(hidden, down).to(
-                        device
-                    )
+                activations = naive_moe_expert_activations(moe_module.experts, flat_input)
             else:
                 for idx, expert in enumerate(moe_module.experts):
                     activations[idx] = expert(flat_input).to(device)

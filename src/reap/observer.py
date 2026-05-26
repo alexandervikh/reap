@@ -26,14 +26,51 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def naive_moe_expert_activations(
+    experts_mod: nn.Module,
+    flat_input: torch.Tensor,
+) -> torch.Tensor:
+    """All-expert routed activations via batched matmul: (num_experts, tokens, hidden)."""
+    compute_dtype = flat_input.dtype
+    block_size = getattr(experts_mod, "block_size", None)
+    gu_scales = getattr(experts_mod, "gate_up_proj_scale_inv", None)
+    d_scales = getattr(experts_mod, "down_proj_scale_inv", None)
+
+    gate_up = experts_mod.gate_up_proj
+    down_proj = experts_mod.down_proj
+    if gate_up.element_size() == 1 and gu_scales is not None:
+        gate_up_bf = fused_expert_weight_for_observer(
+            gate_up, compute_dtype, scale_inv=gu_scales, block_size=block_size
+        )
+        down_bf = fused_expert_weight_for_observer(
+            down_proj, compute_dtype, scale_inv=d_scales, block_size=block_size
+        )
+    else:
+        gate_up_bf = fused_expert_weight_for_observer(gate_up, compute_dtype)
+        down_bf = fused_expert_weight_for_observer(down_proj, compute_dtype)
+
+    gu_out = torch.einsum("th,eih->eti", flat_input, gate_up_bf)
+    gate, up = gu_out.chunk(2, dim=-1)
+    hidden = experts_mod.act_fn(gate) * up
+    return torch.einsum("eti,ehi->eth", hidden, down_bf).to(flat_input.device)
+
+
 def fused_expert_weight_for_observer(
-    weight: torch.Tensor, compute_dtype: torch.dtype
+    weight: torch.Tensor,
+    compute_dtype: torch.dtype,
+    *,
+    scale_inv: torch.Tensor | None = None,
+    block_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Cast fused expert weights to activation dtype for observer matmuls.
 
     FP8 checkpoints cannot use ``F.linear`` on Float8 weights directly; REAP
-    observer runs matmuls in the activation dtype (typically BF16).
+    dequantizes to the activation dtype (typically BF16) before matmul.
     """
+    if weight.element_size() == 1:
+        from reap.glm_fp8_blackwell import dequantize_fp8_tensor
+
+        return dequantize_fp8_tensor(weight, scale_inv, block_size, compute_dtype)
     if weight.dtype != compute_dtype:
         return weight.to(compute_dtype)
     return weight
@@ -379,22 +416,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                 if router_logits.dim() == 1:
                     router_logits = router_logits.view(-1, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                experts_mod = module.experts
-                compute_dtype = flat_input.dtype
-                for idx in range(num_experts):
-                    gate_up = fused_expert_weight_for_observer(
-                        experts_mod.gate_up_proj[idx], compute_dtype
-                    )
-                    gate, up = torch.nn.functional.linear(flat_input, gate_up).chunk(
-                        2, dim=-1
-                    )
-                    hidden = experts_mod.act_fn(gate) * up
-                    down = fused_expert_weight_for_observer(
-                        experts_mod.down_proj[idx], compute_dtype
-                    )
-                    activations[idx] = torch.nn.functional.linear(hidden, down).to(
-                        device
-                    )
+                activations = naive_moe_expert_activations(module.experts, flat_input)
 
             elif self.hook_config.fused_experts:
                 _, router_scores = output  # (num_experts, total_tokens)
@@ -543,7 +565,7 @@ class MixtralMoEObserverHookConfig(MoETransformerObserverConfig):
 
 @dataclass
 class DeepSeekMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "DeepseekV2MoE"
+    module_class_name_to_hook_regex: Optional[str] = "DeepseekV2Moe"
     num_experts_attr_name: str = "experts_per_rank"  # only for ep=1!
     top_k_attr_name: str = "num_experts_per_tok"
     fused_experts: bool = False

@@ -100,7 +100,9 @@ def _make_deepseek_v2_model():
             num_key_value_heads=1,
             n_routed_experts=2,
             num_experts_per_tok=1,
-            n_shared_experts=None,
+            n_shared_experts=0,
+            first_k_dense_replace=0,
+            moe_layer_freq=1,
         )
     )
     model.eval()
@@ -235,7 +237,7 @@ MOE_LOOKUP_CASES = [
         _make_mixtral_model,
         _make_mixtral_hook_config,
         [0, 1, 2],
-        "block_sparse_moe",
+        "mlp",
         id="MixtralForCausalLM",
     ),
     pytest.param(

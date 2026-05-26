@@ -145,7 +145,7 @@ def _make_deepseek_model():
             num_key_value_heads=1,
             n_routed_experts=3,
             num_experts_per_tok=1,
-            n_shared_experts=None,
+            n_shared_experts=0,
             first_k_dense_replace=0,
             moe_layer_freq=1,
             scoring_func="softmax",
@@ -384,6 +384,15 @@ def _make_llama4_model():
     return model
 
 
+def _assert_glm_moe_dsa_fused_expert_counts(model, layer_idx: int, expected: int) -> None:
+    assert model.config.n_routed_experts == expected
+    moe = get_moe(model, layer_idx)
+    assert moe.n_routed_experts == expected
+    assert moe.experts.num_experts == expected
+    assert moe.gate.n_routed_experts == expected
+    assert not hasattr(moe, "num_experts")
+
+
 def test_glm_moe_dsa_fused_expert_count_attrs(tmp_path):
     """GlmMoeDsa fused prune updates n_routed_experts on the MoE block, not num_experts."""
     torch.manual_seed(0)
@@ -402,13 +411,42 @@ def test_glm_moe_dsa_fused_expert_count_attrs(tmp_path):
         subdir_name="glm_moe_dsa_fused_counts",
     )
     assert pruned_dir.exists()
-    expected = 4 - n_experts_to_prune
-    assert model.config.n_routed_experts == expected
-    moe = get_moe(model, 2)
-    assert moe.n_routed_experts == expected
-    assert moe.experts.num_experts == expected
-    assert moe.gate.n_routed_experts == expected
-    assert not hasattr(moe, "num_experts")
+    _assert_glm_moe_dsa_fused_expert_counts(model, 2, 4 - n_experts_to_prune)
+
+
+def test_glm_moe_dsa_layerwise_fused_expert_count_attrs(tmp_path):
+    """Layerwise observer + reap prune preserves GlmMoeDsa fused expert-count attrs."""
+    torch.manual_seed(0)
+    model = _make_glm_moe_dsa_model()
+    batches = _make_mock_batches()
+    obs_args = ObserverArgs(
+        output_file_name="glm_layerwise_obs.pt",
+        record_pruning_metrics_only=True,
+        renormalize_router_weights=True,
+    )
+    layerwise_observer_data = _layerwise_observer_data(
+        model=model,
+        batches=batches,
+        obs_args=obs_args,
+        results_dir=tmp_path / "layerwise_obs",
+    )
+    assert 2 in _moe_layer_indices(layerwise_observer_data)
+    observer_data = {
+        2: {
+            "expert_frequency": layerwise_observer_data[2]["expert_frequency"],
+            "total_tokens": layerwise_observer_data[2]["total_tokens"],
+            "reap": layerwise_observer_data[2]["reap"],
+        }
+    }
+    prune_model = _make_glm_moe_dsa_model()
+    pruned_dir, n_experts_to_prune = _run_prune(
+        observer_data=observer_data,
+        model=prune_model,
+        tmp_path=tmp_path,
+        subdir_name="glm_moe_dsa_layerwise_fused_counts",
+    )
+    assert pruned_dir.exists()
+    _assert_glm_moe_dsa_fused_expert_counts(prune_model, 2, 4 - n_experts_to_prune)
 
 
 def test_fused_prune_without_experts_num_experts_attribute(tmp_path):
