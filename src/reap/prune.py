@@ -42,6 +42,7 @@ from reap.model_util import (
     get_model_device,
 )
 from reap.eval import run_evaluate
+from reap.glm_fp8_blackwell import apply_glm_fp8_blackwell_fallback, is_blackwell_gpu
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,10 @@ def prune(
         ]
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
+    gen_cfg = getattr(model, "generation_config", None)
+    if gen_cfg is not None and getattr(gen_cfg, "top_p", None) is not None:
+        if not getattr(gen_cfg, "do_sample", False):
+            gen_cfg.do_sample = True
     start = time.time()
     model.save_pretrained(pruned_model_dir)
     end = time.time()
@@ -309,15 +314,19 @@ def main():
 
     # get local patched model if req'd
     model_name = patched_model_map(model_args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    # load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        **get_from_pretrained_kwargs(
-            device_map="auto",
-            local_files_only=pathlib.Path(model_name).exists(),
-        ),
+    use_fp8_blackwell = (
+        ("GLM-5.1-FP8" in str(model_args.model_name) or "GLM-5.1-FP8" in model_name)
+        and is_blackwell_gpu()
     )
+    if use_fp8_blackwell:
+        apply_glm_fp8_blackwell_fallback()
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    load_kwargs = get_from_pretrained_kwargs(
+        device_map="auto",
+        local_files_only=pathlib.Path(model_name).exists(),
+        low_cpu_mem_usage=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
     # record activations or load previously recorded activations
     logger.info(
         f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
