@@ -18,7 +18,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 import uvloop
 
 from reap.args import ReapArgs, ModelArgs, EvalArgs
-from reap.model_util import patched_model_map, MODEL_ATTRS
+from reap.model_util import patched_model_map, MODEL_ATTRS, vllm_supported_for_eval
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -181,6 +181,12 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
         model_name = model_name.__str__()
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     use_server = eval_args.use_server
+    if use_server and not vllm_supported_for_eval(model_name):
+        logger.warning(
+            "vLLM server disabled for %s (glm_moe_dsa / GLM-5.1); using HF backends",
+            model_name,
+        )
+        use_server = False
     if results_dir is None:
         model_short_name = model_name.split("/")[-1]
         if model_args.num_experts_per_tok_override is not None:
@@ -312,30 +318,33 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
     try:
         if eval_args.run_livecodebench:
             if not use_server:
-                raise ValueError(
-                    "Current LCB ReapBase model style implementation requries a vLLM server to be running"
+                logger.warning(
+                    "Skipping LiveCodeBench for %s: requires a vLLM server "
+                    "(use HF lm-eval / evalplus only for GLM-5.1)",
+                    model_name,
                 )
-            from lcb_runner.runner.main import main as lcb_main
-            from lcb_runner.runner.main import get_args_dict
+            elif use_server:
+                from lcb_runner.runner.main import main as lcb_main
+                from lcb_runner.runner.main import get_args_dict
 
-            original_model, uncompressed_model = get_original_model_name(model_name)
+                original_model, uncompressed_model = get_original_model_name(model_name)
 
-            lcb_args = get_args_dict(
-                model=original_model,
-                n=1,
-                output_path=results_dir,
-                enable_thinking=False,
-                base_url=f"{server_endpoint}/v1",
-                start_date="2025-01-01",
-                end_date="2025-07-31",
-                evaluate=True,
-                timeout=120,
-                local_model_path=model_name if not uncompressed_model else None,
-                max_tokens=16384,
-            )
-            logger.info(f"Running LiveCodeBench with args: {lcb_args}")
-            lcb_main(lcb_args)
-            logger.info(f"Finished evaluating LiveCodeBench")
+                lcb_args = get_args_dict(
+                    model=original_model,
+                    n=1,
+                    output_path=results_dir,
+                    enable_thinking=False,
+                    base_url=f"{server_endpoint}/v1",
+                    start_date="2025-01-01",
+                    end_date="2025-07-31",
+                    evaluate=True,
+                    timeout=120,
+                    local_model_path=model_name if not uncompressed_model else None,
+                    max_tokens=16384,
+                )
+                logger.info(f"Running LiveCodeBench with args: {lcb_args}")
+                lcb_main(lcb_args)
+                logger.info("Finished evaluating LiveCodeBench")
     except Exception as e:
         logger.error(f"An error occurred during livecodebench: {e}")
         pass
