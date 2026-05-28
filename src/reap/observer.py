@@ -22,7 +22,11 @@ from reap.metrics import (
     OnlineStatsTracker,
     get_distance_fn,
 )
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.pruning_metrics import (
+    initialize_pruning_state,
+    update_pruning_state,
+    update_pruning_state_from_selected_experts,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,6 +71,31 @@ def _glm_moe_dsa_all_expert_activations(
         hidden = experts_mod.act_fn(gate) * up
         outputs.append(F.linear(hidden, down_w))
     return torch.stack(outputs, dim=0)
+
+
+def _glm_moe_dsa_selected_expert_activations(
+    experts_mod: nn.Module,
+    flat_input: torch.Tensor,
+    selected_experts: torch.Tensor,
+) -> dict[int, torch.Tensor]:
+    """Compute GlmMoeDsa expert outputs only for tokens routed to each expert."""
+    _materialize_fused_expert_weights(experts_mod)
+    outputs: dict[int, torch.Tensor] = {}
+    for expert_idx in torch.unique(selected_experts).detach().cpu().tolist():
+        active_mask = (selected_experts == expert_idx).any(dim=-1)
+        if not active_mask.any():
+            continue
+        routed_input = flat_input[active_mask]
+        gate_up_w = experts_mod.gate_up_proj[expert_idx]
+        down_w = experts_mod.down_proj[expert_idx]
+        if gate_up_w.is_meta or down_w.is_meta:
+            raise RuntimeError(
+                f"Expert {expert_idx} weights still meta; use GLM51_LOAD_MODE=fast_ram."
+            )
+        gate, up = F.linear(routed_input, gate_up_w).chunk(2, dim=-1)
+        hidden = experts_mod.act_fn(gate) * up
+        outputs[int(expert_idx)] = F.linear(hidden, down_w)
+    return outputs
 
 
 def naive_moe_expert_activations(
@@ -451,8 +480,6 @@ class MoETransformerObserver(BaseTransformerObserver):
                 # No mask provided - treat all tokens as valid
                 flat_mask = None
 
-            activations = torch.zeros((num_experts, *flat_input.shape), device=device)
-
             if self.hook_config.compute_router_logits_from_input:
                 router_module = getattr(module, "gate", None) or getattr(
                     module, "router", None
@@ -465,6 +492,38 @@ class MoETransformerObserver(BaseTransformerObserver):
                 if router_logits.dim() == 1:
                     router_logits = router_logits.view(-1, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                if (
+                    self.hook_config.record_pruning_metrics_only
+                    and module.experts.__class__.__name__ == "GlmMoeDsaNaiveMoe"
+                ):
+                    sparse_input = flat_input
+                    sparse_selected_experts = selected_experts
+                    sparse_router_logits = router_logits
+                    if flat_mask is not None:
+                        sparse_input = flat_input[flat_mask]
+                        sparse_selected_experts = selected_experts[flat_mask]
+                        sparse_router_logits = router_logits[flat_mask]
+                    expert_activations = _glm_moe_dsa_selected_expert_activations(
+                        module.experts,
+                        sparse_input,
+                        sparse_selected_experts,
+                    )
+                    update_pruning_state_from_selected_experts(
+                        self.state[layer_number],
+                        expert_activations=expert_activations,
+                        selected_experts=sparse_selected_experts,
+                        router_logits=sparse_router_logits,
+                        num_experts=num_experts,
+                        renormalize_router_weights=self.hook_config.renormalize_router_weights,
+                    )
+                    del (
+                        flat_input,
+                        expert_activations,
+                        selected_experts,
+                        router_logits,
+                    )
+                    gc.collect()
+                    return
                 activations = naive_moe_expert_activations(module.experts, flat_input)
 
             elif self.hook_config.fused_experts:
@@ -489,6 +548,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                 activations = routed_out.view(num_experts, *flat_input.shape)
 
             else:  # loop based MoE execution
+                activations = torch.zeros((num_experts, *flat_input.shape), device=device)
                 # ernie returns combined_output, combine_weights, router_loss, gate_logits
                 *_, router_logits = output  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
