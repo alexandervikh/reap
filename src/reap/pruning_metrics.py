@@ -78,19 +78,24 @@ def _prepare_pruning_batch(
     mask, validates the resulting shapes, and precomputes token counts and routing
     frequencies needed by downstream pruning updates.
     """
-    device = activations.device
-    selected_experts = selected_experts.reshape(-1, selected_experts.shape[-1]).to(device)
-    router_logits = router_logits.to(device)
-
-    # Filter out padding tokens if attention mask is provided
     if valid_token_mask is not None:
-        valid_token_mask = valid_token_mask.reshape(-1).bool().to(device)
-        # Filter activations: (num_experts, total_tokens, hidden_dim) -> (num_experts, num_valid_tokens, hidden_dim)
-        activations = activations[:, valid_token_mask, :]
-        # Filter selected_experts: (total_tokens, top_k) -> (num_valid_tokens, top_k)
-        selected_experts = selected_experts[valid_token_mask]
-        # Filter router_logits: (total_tokens, num_experts) -> (num_valid_tokens, num_experts)
-        router_logits = router_logits[valid_token_mask]
+        # Index on CPU so we do not allocate a second large
+        # [num_experts, total_tokens, hidden_dim] tensor on GPU (GLM-scale MoE).
+        valid = valid_token_mask.reshape(-1).bool()
+        if valid.device.type != "cpu":
+            valid = valid.cpu()
+        activations = activations.detach().cpu()[:, valid, :]
+        selected_experts = (
+            selected_experts.reshape(-1, selected_experts.shape[-1]).detach().cpu()[valid]
+        )
+        router_logits = router_logits.detach().cpu()[valid]
+        device = activations.device
+    else:
+        device = activations.device
+        selected_experts = selected_experts.reshape(
+            -1, selected_experts.shape[-1]
+        ).to(device)
+        router_logits = router_logits.to(device)
 
     if activations.shape[0] != num_experts:
         raise ValueError(
@@ -214,3 +219,83 @@ def update_pruning_state(
     )
 
     return pruning_batch
+
+
+def update_pruning_state_from_selected_experts(
+    layer_state: dict[str, Any],
+    *,
+    expert_activations: dict[int, torch.Tensor],
+    selected_experts: torch.Tensor,
+    router_logits: torch.Tensor,
+    num_experts: int,
+    valid_token_mask: Optional[torch.Tensor] = None,
+    renormalize_router_weights: bool = False,
+) -> None:
+    """Accumulate pruning metrics from routed expert outputs only.
+
+    The dense path builds activations for every expert/token pair, then only consumes
+    activations for tokens routed to that expert. This helper preserves those pruning
+    metrics while allowing callers to compute only the routed expert outputs.
+    """
+    if valid_token_mask is not None:
+        valid = valid_token_mask.reshape(-1).bool().to(selected_experts.device)
+        selected_experts = selected_experts.reshape(-1, selected_experts.shape[-1])[valid]
+        router_logits = router_logits[valid]
+    else:
+        selected_experts = selected_experts.reshape(-1, selected_experts.shape[-1])
+
+    num_tokens = torch.tensor(selected_experts.shape[0], device="cpu", dtype=torch.long)
+    if selected_experts.numel() == 0:
+        expert_frequency = torch.zeros(num_experts, device="cpu", dtype=torch.long)
+    else:
+        expert_frequency = torch.bincount(
+            selected_experts.reshape(-1).to("cpu"), minlength=num_experts
+        )
+    pairwise_expert_frequency = expert_frequency.unsqueeze(0) + expert_frequency.unsqueeze(1)
+
+    layer_state["total_tokens"] += num_tokens
+    layer_state["expert_frequency"] += expert_frequency
+    layer_state["pairwise_expert_frequency"] += pairwise_expert_frequency
+
+    metric_device = router_logits.device
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(metric_device)
+    selected_for_gather = selected_experts.to(metric_device)
+    if renormalize_router_weights and selected_for_gather.numel() > 0:
+        topk_weights = torch.gather(routing_weights, 1, selected_for_gather)
+        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
+        routing_weights = torch.clamp(
+            routing_weights, min=torch.finfo(routing_weights.dtype).eps
+        )
+
+    ean_sum = torch.zeros(num_experts, device=metric_device, dtype=torch.float64)
+    ean_mean = torch.zeros(num_experts, device=metric_device, dtype=torch.float32)
+    weighted_ean_sum = torch.zeros(num_experts, device=metric_device, dtype=torch.float64)
+    reap = torch.zeros(num_experts, device=metric_device, dtype=torch.float32)
+    weighted_expert_frequency_sum = torch.zeros(
+        num_experts, device=metric_device, dtype=torch.float64
+    )
+
+    for expert_idx, selected_activations in expert_activations.items():
+        if selected_activations.numel() == 0:
+            continue
+        active_router_weights = routing_weights[:, expert_idx][
+            (selected_for_gather == expert_idx).any(dim=-1)
+        ]
+        ean_norm = torch.linalg.norm(selected_activations.to(metric_device), dim=-1)
+        ean_sum[expert_idx] = ean_norm.sum()
+        ean_mean[expert_idx] = ean_norm.mean()
+        weighted_expert_frequency_sum[expert_idx] = active_router_weights.sum()
+        weighted_ean_sum[expert_idx] = (ean_norm * active_router_weights).sum()
+        reap[expert_idx] = (ean_norm * active_router_weights).mean()
+
+        selected_activations_max = selected_activations.max().to(device="cpu")
+        if selected_activations_max > layer_state["max_activations"][expert_idx]:
+            layer_state["max_activations"][expert_idx] = selected_activations_max
+
+    layer_state["ean_sum"] += ean_sum.to(device="cpu")
+    layer_state["ean_mean"].update(ean_mean.to("cpu"), expert_frequency)
+    layer_state["weighted_ean_sum"] += weighted_ean_sum.to(device="cpu")
+    layer_state["reap"].update(reap.to("cpu"), expert_frequency)
+    layer_state["weighted_expert_frequency_sum"] += weighted_expert_frequency_sum.to(
+        device="cpu"
+    )

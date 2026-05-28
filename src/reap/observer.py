@@ -7,6 +7,7 @@ from functools import reduce
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import re
 from dataclasses import dataclass
 import logging
@@ -20,10 +21,113 @@ from reap.metrics import (
     OnlineStatsTracker,
     get_distance_fn,
 )
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.pruning_metrics import (
+    initialize_pruning_state,
+    update_pruning_state,
+    update_pruning_state_from_selected_experts,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _materialize_fused_expert_weights(experts_mod: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ensure fused expert weights are materialized (not accelerate meta placeholders)."""
+    gate_up = experts_mod.gate_up_proj
+    down_proj = experts_mod.down_proj
+    if gate_up.is_meta or down_proj.is_meta:
+        for mod in (experts_mod, getattr(experts_mod, "experts", None)):
+            if mod is None:
+                continue
+            hook = getattr(mod, "_hf_hook", None)
+            if hook is not None and hasattr(hook, "pre_forward"):
+                hook.pre_forward(mod)
+        gate_up = experts_mod.gate_up_proj
+        down_proj = experts_mod.down_proj
+        if gate_up.is_meta or down_proj.is_meta:
+            raise RuntimeError(
+                "Fused expert weights are still on the meta device after pre_forward. "
+                "For GLM-5.1 BF16 monolithic REAP use GLM51_LOAD_MODE=fast_ram."
+            )
+    return gate_up, down_proj
+
+
+def _glm_moe_dsa_all_expert_activations(
+    experts_mod: nn.Module,
+    flat_input: torch.Tensor,
+) -> torch.Tensor:
+    """Per-expert F.linear path for GlmMoeDsaNaiveMoe (matches HF forward, avoids meta einsum)."""
+    _materialize_fused_expert_weights(experts_mod)
+    outputs: list[torch.Tensor] = []
+    for expert_idx in range(experts_mod.num_experts):
+        gate_up_w = experts_mod.gate_up_proj[expert_idx]
+        down_w = experts_mod.down_proj[expert_idx]
+        if gate_up_w.is_meta or down_w.is_meta:
+            raise RuntimeError(
+                f"Expert {expert_idx} weights still meta; use GLM51_LOAD_MODE=fast_ram."
+            )
+        gate, up = F.linear(flat_input, gate_up_w).chunk(2, dim=-1)
+        hidden = experts_mod.act_fn(gate) * up
+        outputs.append(F.linear(hidden, down_w))
+    return torch.stack(outputs, dim=0)
+
+
+def _glm_moe_dsa_selected_expert_activations(
+    experts_mod: nn.Module,
+    flat_input: torch.Tensor,
+    selected_experts: torch.Tensor,
+) -> dict[int, torch.Tensor]:
+    """Compute GlmMoeDsa expert outputs only for tokens routed to each expert."""
+    _materialize_fused_expert_weights(experts_mod)
+    outputs: dict[int, torch.Tensor] = {}
+    for expert_idx in torch.unique(selected_experts).detach().cpu().tolist():
+        active_mask = (selected_experts == expert_idx).any(dim=-1)
+        if not active_mask.any():
+            continue
+        routed_input = flat_input[active_mask]
+        gate_up_w = experts_mod.gate_up_proj[expert_idx]
+        down_w = experts_mod.down_proj[expert_idx]
+        if gate_up_w.is_meta or down_w.is_meta:
+            raise RuntimeError(
+                f"Expert {expert_idx} weights still meta; use GLM51_LOAD_MODE=fast_ram."
+            )
+        gate, up = F.linear(routed_input, gate_up_w).chunk(2, dim=-1)
+        hidden = experts_mod.act_fn(gate) * up
+        outputs[int(expert_idx)] = F.linear(hidden, down_w)
+    return outputs
+
+
+def naive_moe_expert_activations(
+    experts_mod: nn.Module,
+    flat_input: torch.Tensor,
+) -> torch.Tensor:
+    """All-expert routed activations via batched matmul: (num_experts, tokens, hidden)."""
+    if experts_mod.__class__.__name__ == "GlmMoeDsaNaiveMoe":
+        return _glm_moe_dsa_all_expert_activations(experts_mod, flat_input)
+
+    compute_dtype = flat_input.dtype
+    gate_up, down_proj = _materialize_fused_expert_weights(experts_mod)
+    gate_up_bf = fused_expert_weight_for_observer(gate_up, compute_dtype)
+    down_bf = fused_expert_weight_for_observer(down_proj, compute_dtype)
+
+    gu_out = torch.einsum("th,eih->eti", flat_input, gate_up_bf)
+    gate, up = gu_out.chunk(2, dim=-1)
+    hidden = experts_mod.act_fn(gate) * up
+    return torch.einsum("eti,ehi->eth", hidden, down_bf).to(flat_input.device)
+
+
+def fused_expert_weight_for_observer(
+    weight: torch.Tensor,
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Cast fused expert weights to activation dtype for observer matmuls."""
+    if weight.is_meta:
+        raise RuntimeError(
+            "Cannot use meta expert weight in observer; set GLM51_LOAD_MODE=cpu_dispatch."
+        )
+    if weight.dtype != compute_dtype:
+        return weight.to(compute_dtype)
+    return weight
 
 
 class BaseTransformerObserverHookConfig:
@@ -220,6 +324,8 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     num_experts_attr_name: str = "num_experts"
     top_k_attr_name: str = "top_k"
     fused_experts: bool = False
+    compute_router_logits_from_input: bool = False
+    naive_expert_tensors: bool = False
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
     record_pruning_metrics_only: bool = False
@@ -328,15 +434,17 @@ class MoETransformerObserver(BaseTransformerObserver):
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
-            if not len(output) >= 2:
-                raise ValueError(
-                    f"Expected output of module {module.__class__.__name__} at layer "
-                    f"{layer_number} to be a tuple of at least length 2, got {len(output)}."
-                )
+            if not self.hook_config.compute_router_logits_from_input:
+                if not isinstance(output, tuple) or len(output) < 2:
+                    raise ValueError(
+                        f"Expected output of module {module.__class__.__name__} at layer "
+                        f"{layer_number} to be a tuple of at least length 2, got {type(output)}."
+                    )
             input = args[0]  # (batch_size, seq_len, hidden_dim)
             device = input.device
             if layer_number not in self.state:
-                self.state[layer_number] = self._initialize_state(output, num_experts)
+                init_output = output if isinstance(output, tuple) else (output,)
+                self.state[layer_number] = self._initialize_state(init_output, num_experts)
             batch_size, sequence_length, hidden_dim = input.shape
             flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
 
@@ -348,9 +456,53 @@ class MoETransformerObserver(BaseTransformerObserver):
                 # No mask provided - treat all tokens as valid
                 flat_mask = None
 
-            activations = torch.zeros((num_experts, *flat_input.shape), device=device)
+            if self.hook_config.compute_router_logits_from_input:
+                router_module = getattr(module, "gate", None) or getattr(
+                    module, "router", None
+                )
+                if router_module is None:
+                    raise ValueError(
+                        f"No gate/router on {module.__class__.__name__} at layer {layer_number}"
+                    )
+                router_logits = router_module(flat_input)
+                if router_logits.dim() == 1:
+                    router_logits = router_logits.view(-1, num_experts)
+                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                if (
+                    self.hook_config.record_pruning_metrics_only
+                    and module.experts.__class__.__name__ == "GlmMoeDsaNaiveMoe"
+                ):
+                    sparse_input = flat_input
+                    sparse_selected_experts = selected_experts
+                    sparse_router_logits = router_logits
+                    if flat_mask is not None:
+                        sparse_input = flat_input[flat_mask]
+                        sparse_selected_experts = selected_experts[flat_mask]
+                        sparse_router_logits = router_logits[flat_mask]
+                    expert_activations = _glm_moe_dsa_selected_expert_activations(
+                        module.experts,
+                        sparse_input,
+                        sparse_selected_experts,
+                    )
+                    update_pruning_state_from_selected_experts(
+                        self.state[layer_number],
+                        expert_activations=expert_activations,
+                        selected_experts=sparse_selected_experts,
+                        router_logits=sparse_router_logits,
+                        num_experts=num_experts,
+                        renormalize_router_weights=self.hook_config.renormalize_router_weights,
+                    )
+                    del (
+                        flat_input,
+                        expert_activations,
+                        selected_experts,
+                        router_logits,
+                    )
+                    gc.collect()
+                    return
+                activations = naive_moe_expert_activations(module.experts, flat_input)
 
-            if self.hook_config.fused_experts:
+            elif self.hook_config.fused_experts:
                 _, router_scores = output  # (num_experts, total_tokens)
                 router_logits = module.router(flat_input)  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
@@ -372,6 +524,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                 activations = routed_out.view(num_experts, *flat_input.shape)
 
             else:  # loop based MoE execution
+                activations = torch.zeros((num_experts, *flat_input.shape), device=device)
                 # ernie returns combined_output, combine_weights, router_loss, gate_logits
                 *_, router_logits = output  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
@@ -392,6 +545,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                 valid_token_mask=flat_mask,
                 renormalize_router_weights=self.hook_config.renormalize_router_weights,
             )
+            del activations
 
             # Merging critera
             if not self.hook_config.record_pruning_metrics_only:
@@ -466,7 +620,6 @@ class MoETransformerObserver(BaseTransformerObserver):
 
             # --- CLEAN UP -------------------------------------------------------------
             del (
-                activations,
                 selected_experts,
                 router_logits,
                 pruning_batch,
@@ -524,6 +677,16 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
     fused_experts: bool = False
 
 
+@dataclass
+class GlmMoeDsaObserverHookConfig(MoETransformerObserverConfig):
+    module_class_name_to_hook_regex: Optional[str] = "GlmMoeDsaMoE"
+    num_experts_attr_name: str = "config.n_routed_experts"
+    top_k_attr_name: str = "config.num_experts_per_tok"
+    fused_experts: bool = False
+    compute_router_logits_from_input: bool = True
+    naive_expert_tensors: bool = True
+
+
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
@@ -533,4 +696,5 @@ OBSERVER_CONFIG_REGISTRY = {
     "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
+    "GlmMoeDsaForCausalLM": GlmMoeDsaObserverHookConfig,
 }
