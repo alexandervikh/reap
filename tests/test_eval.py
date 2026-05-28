@@ -16,4 +16,7 @@ def test_evalplus_attn_implementation_env_override(monkeypatch):
 
 def test_hf_evalplus_supported_for_eval_skips_glm():
     assert not hf_evalplus_supported_for_eval("/tmp/GLM-5.1/pruned")
+    assert not hf_evalplus_supported_for_eval(
+        "/tmp/reap-glm51-pruned/evol-codealpaca-v1/reap-renorm_true-seed_42-0.25"
+    )
     assert hf_evalplus_supported_for_eval("Qwen/Qwen3-30B-A3B")

@@ -34,8 +34,27 @@ def evalplus_attn_implementation(model_name: str) -> str:
     return "flash_attention_2"
 
 
+def _is_glm_moe_checkpoint(model_name: str) -> bool:
+    """Detect GLM MoE checkpoints even when the path omits ``GLM-5.1`` (e.g. /tmp/reap-glm51-pruned/...)."""
+    lower = str(model_name).lower()
+    if "glm-5.1" in lower or "glm_moe_dsa" in lower or "glmmoe" in lower:
+        return True
+    config_path = pathlib.Path(model_name) / "config.json"
+    if config_path.is_file():
+        cfg = json.loads(config_path.read_text())
+        archs = cfg.get("architectures") or []
+        if archs and "glmmoe" in str(archs[0]).lower():
+            return True
+        model_type = str(cfg.get("model_type", "")).lower()
+        if "glm" in model_type and "moe" in model_type:
+            return True
+    return False
+
+
 def hf_evalplus_supported_for_eval(model_name: str) -> bool:
     """Whether evalplus' local HF decoder can load this checkpoint directly."""
+    if _is_glm_moe_checkpoint(model_name):
+        return False
     return vllm_supported_for_eval(model_name)
 
 
@@ -355,8 +374,12 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                         )
     except Exception as e:
         logger.error(f"An error occurred during evalplus: {e}")
-        raise e
-        pass
+        if eval_args.run_evalplus and not use_server and not hf_evalplus_supported_for_eval(
+            model_name
+        ):
+            logger.warning("EvalPlus failed after skip path; continuing without EvalPlus.")
+        else:
+            raise
     try:
         if eval_args.run_livecodebench:
             if not use_server:

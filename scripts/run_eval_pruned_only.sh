@@ -23,8 +23,8 @@ echo "=== HF eval on ${PRUNED} ===" | tee "$LOG"
   --vllm_port 8000 \
   --server_log_file_name "glm-5.1-eval-seed_${SEED}.log" \
   --run-lm-eval true \
-  --run-evalplus true \
-  --run-livecodebench true \
+  --run-evalplus "${RUN_EVALPLUS:-false}" \
+  --run-livecodebench "${RUN_LIVECODEBENCH:-false}" \
   --run-wildbench false \
   --run-math false \
   --use-server false \
