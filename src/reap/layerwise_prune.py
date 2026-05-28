@@ -57,8 +57,6 @@ from reap.eval import run_evaluate
 from reap.prune import prune as prune_model
 from reap.prune import get_pruned_model_dir
 from reap.main import dump_args_to_yaml, create_results_directory
-from reap.glm_fp8_blackwell import apply_glm_fp8_blackwell_fallback, is_blackwell_gpu
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -258,12 +256,6 @@ def main():
 
     # Get patched model name if needed
     model_name = patched_model_map(model_args.model_name)
-    use_fp8_blackwell = (
-        ("GLM-5.1-FP8" in str(model_args.model_name) or "GLM-5.1-FP8" in model_name)
-        and is_blackwell_gpu()
-    )
-    if use_fp8_blackwell:
-        apply_glm_fp8_blackwell_fallback()
 
     # Load tokenizer
     logger.info(f"Loading tokenizer for {model_name}...")

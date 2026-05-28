@@ -1,10 +1,12 @@
 import copy
 import sys
+from types import SimpleNamespace
 from dataclasses import replace
 
 import pytest
 import torch
 import transformers.utils as transformers_utils
+from safetensors.torch import load_file
 from transformers import (
     DeepseekV2Config,
     Ernie4_5_MoeConfig,
@@ -447,6 +449,62 @@ def test_glm_moe_dsa_layerwise_fused_expert_count_attrs(tmp_path):
     )
     assert pruned_dir.exists()
     _assert_glm_moe_dsa_fused_expert_counts(prune_model, 2, 4 - n_experts_to_prune)
+
+
+def test_glm_moe_dsa_offloaded_fused_experts_save_with_native_keys(tmp_path):
+    """Offloaded fused experts must save pruned native tensors, not stale offload weights."""
+    torch.manual_seed(0)
+    model = _make_glm_moe_dsa_model()
+    moe = get_moe(model, 2)
+    experts = moe.experts
+    gate_up_proj = experts.gate_up_proj.detach().clone()
+    down_proj = experts.down_proj.detach().clone()
+    gate_weight = moe.gate.weight.detach().clone()
+    experts.gate_up_proj = torch.nn.Parameter(
+        torch.empty_like(gate_up_proj, device="meta")
+    )
+    experts.down_proj = torch.nn.Parameter(torch.empty_like(down_proj, device="meta"))
+    moe.gate.weight = torch.nn.Parameter(torch.empty_like(gate_weight, device="meta"))
+    experts._hf_hook = SimpleNamespace(
+        weights_map={
+            "gate_up_proj": gate_up_proj,
+            "down_proj": down_proj,
+        }
+    )
+    moe.gate._hf_hook = SimpleNamespace(weights_map={"weight": gate_weight})
+    model.hf_device_map = {
+        "model.layers.2.mlp.experts": "cpu",
+        "model.layers.2.mlp.gate": "cpu",
+        "lm_head": 0,
+    }
+
+    observer_data = {
+        2: {
+            "expert_frequency": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+            "total_tokens": torch.tensor(10.0),
+        }
+    }
+    pruned_dir, n_experts_to_prune = _run_prune(
+        observer_data=observer_data,
+        model=model,
+        tmp_path=tmp_path,
+        subdir_name="glm_moe_dsa_offloaded_fused_save",
+    )
+    expected_count = 4 - n_experts_to_prune
+
+    _assert_glm_moe_dsa_fused_expert_counts(model, 2, expected_count)
+
+    saved_tensors = load_file(pruned_dir / "model.safetensors")
+    assert saved_tensors["model.layers.2.mlp.experts.gate_up_proj"].shape[0] == expected_count
+    assert saved_tensors["model.layers.2.mlp.experts.down_proj"].shape[0] == expected_count
+    assert saved_tensors["model.layers.2.mlp.gate.weight"].shape[0] == expected_count
+    assert torch.equal(
+        saved_tensors["model.layers.2.mlp.experts.gate_up_proj"],
+        gate_up_proj[1:],
+    )
+    assert torch.equal(saved_tensors["model.layers.2.mlp.experts.down_proj"], down_proj[1:])
+    assert torch.equal(saved_tensors["model.layers.2.mlp.gate.weight"], gate_weight[1:])
+    assert not any(".experts.0." in key for key in saved_tensors)
 
 
 def test_fused_prune_without_experts_num_experts_attribute(tmp_path):

@@ -3,10 +3,12 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Optional
 import gc
+import os
 from functools import reduce
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import re
 from dataclasses import dataclass
 import logging
@@ -26,18 +28,61 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _materialize_fused_expert_weights(experts_mod: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ensure fused expert weights are materialized (not accelerate meta placeholders)."""
+    gate_up = experts_mod.gate_up_proj
+    down_proj = experts_mod.down_proj
+    if gate_up.is_meta or down_proj.is_meta:
+        for mod in (experts_mod, getattr(experts_mod, "experts", None)):
+            if mod is None:
+                continue
+            hook = getattr(mod, "_hf_hook", None)
+            if hook is not None and hasattr(hook, "pre_forward"):
+                hook.pre_forward(mod)
+        gate_up = experts_mod.gate_up_proj
+        down_proj = experts_mod.down_proj
+        if gate_up.is_meta or down_proj.is_meta:
+            raise RuntimeError(
+                "Fused expert weights are still on the meta device after pre_forward. "
+                "For GLM-5.1 BF16 monolithic REAP use GLM51_LOAD_MODE=fast_ram."
+            )
+    return gate_up, down_proj
+
+
+def _glm_moe_dsa_all_expert_activations(
+    experts_mod: nn.Module,
+    flat_input: torch.Tensor,
+) -> torch.Tensor:
+    """Per-expert F.linear path for GlmMoeDsaNaiveMoe (matches HF forward, avoids meta einsum)."""
+    _materialize_fused_expert_weights(experts_mod)
+    outputs: list[torch.Tensor] = []
+    for expert_idx in range(experts_mod.num_experts):
+        gate_up_w = experts_mod.gate_up_proj[expert_idx]
+        down_w = experts_mod.down_proj[expert_idx]
+        if gate_up_w.is_meta or down_w.is_meta:
+            raise RuntimeError(
+                f"Expert {expert_idx} weights still meta; use GLM51_LOAD_MODE=fast_ram."
+            )
+        gate, up = F.linear(flat_input, gate_up_w).chunk(2, dim=-1)
+        hidden = experts_mod.act_fn(gate) * up
+        outputs.append(F.linear(hidden, down_w))
+    return torch.stack(outputs, dim=0)
+
+
 def naive_moe_expert_activations(
     experts_mod: nn.Module,
     flat_input: torch.Tensor,
 ) -> torch.Tensor:
     """All-expert routed activations via batched matmul: (num_experts, tokens, hidden)."""
+    if experts_mod.__class__.__name__ == "GlmMoeDsaNaiveMoe":
+        return _glm_moe_dsa_all_expert_activations(experts_mod, flat_input)
+
     compute_dtype = flat_input.dtype
     block_size = getattr(experts_mod, "block_size", None)
     gu_scales = getattr(experts_mod, "gate_up_proj_scale_inv", None)
     d_scales = getattr(experts_mod, "down_proj_scale_inv", None)
 
-    gate_up = experts_mod.gate_up_proj
-    down_proj = experts_mod.down_proj
+    gate_up, down_proj = _materialize_fused_expert_weights(experts_mod)
     if gate_up.element_size() == 1 and gu_scales is not None:
         gate_up_bf = fused_expert_weight_for_observer(
             gate_up, compute_dtype, scale_inv=gu_scales, block_size=block_size
@@ -62,15 +107,19 @@ def fused_expert_weight_for_observer(
     scale_inv: torch.Tensor | None = None,
     block_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """Cast fused expert weights to activation dtype for observer matmuls.
-
-    FP8 checkpoints cannot use ``F.linear`` on Float8 weights directly; REAP
-    dequantizes to the activation dtype (typically BF16) before matmul.
-    """
-    if weight.element_size() == 1:
+    """Cast fused expert weights to activation dtype for observer matmuls."""
+    if weight.element_size() == 1 and os.environ.get("REAP_ENABLE_FP8", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
         from reap.glm_fp8_blackwell import dequantize_fp8_tensor
 
         return dequantize_fp8_tensor(weight, scale_inv, block_size, compute_dtype)
+    if weight.is_meta:
+        raise RuntimeError(
+            "Cannot use meta expert weight in observer; set GLM51_LOAD_MODE=cpu_dispatch."
+        )
     if weight.dtype != compute_dtype:
         return weight.to(compute_dtype)
     return weight

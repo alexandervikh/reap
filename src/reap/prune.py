@@ -10,7 +10,7 @@ import yaml
 
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoTokenizer, HfArgumentParser
 
 from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
@@ -38,11 +38,10 @@ from reap.model_util import (
     MODEL_ATTRS,
     patched_model_map,
     get_super_expert_indices,
-    get_from_pretrained_kwargs,
+    load_causal_lm_for_prune,
     get_model_device,
 )
 from reap.eval import run_evaluate
-from reap.glm_fp8_blackwell import apply_glm_fp8_blackwell_fallback, is_blackwell_gpu
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -116,6 +115,61 @@ def _set_fused_router_counts(router: Any, model_attrs: dict[str, Any], retained_
     _set_module_expert_counts(router, model_attrs, retained_count)
     if hasattr(router, "out_features"):
         router.out_features = retained_count
+
+
+def _module_name_for_prune(model: torch.nn.Module, module: torch.nn.Module) -> str:
+    for name, candidate in model.named_modules():
+        if candidate is module:
+            return name
+    raise ValueError(f"Could not locate {module.__class__.__name__} in model modules")
+
+
+def _materialized_tensor_for_prune(
+    model: torch.nn.Module,
+    module_name: str,
+    attr_name: str,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if tensor.device.type != "meta":
+        return tensor.detach()
+
+    from transformers.integrations.accelerate import load_offloaded_parameter
+
+    full_name = f"{module_name}.{attr_name}" if module_name else attr_name
+    return load_offloaded_parameter(model, full_name).detach()
+
+
+def _index_select_tensor_attr_for_prune(
+    model: torch.nn.Module,
+    module: torch.nn.Module,
+    module_name: str,
+    attr_name: str,
+    retained_indices: list[int],
+    *,
+    dim: int = 0,
+) -> None:
+    tensor = getattr(module, attr_name)
+    source = _materialized_tensor_for_prune(model, module_name, attr_name, tensor)
+    index = torch.as_tensor(retained_indices, device=source.device)
+    pruned = source.index_select(dim, index).contiguous()
+    if isinstance(tensor, torch.nn.Parameter):
+        setattr(
+            module,
+            attr_name,
+            torch.nn.Parameter(pruned, requires_grad=tensor.requires_grad),
+        )
+    else:
+        setattr(module, attr_name, pruned)
+
+
+def _save_pruned_model(model, pruned_model_dir: pathlib.Path, model_attrs: dict[str, Any]) -> None:
+    save_kwargs: dict[str, Any] = {}
+    if model_attrs["fused"]:
+        # Keep fused expert tensors in the model's native state-dict namespace. The
+        # legacy reverse mapping expands them into experts.0.* keys, which cannot
+        # be resolved by HF's offloaded-parameter loader for fused expert modules.
+        save_kwargs["save_original_format"] = False
+    model.save_pretrained(pruned_model_dir, **save_kwargs)
 
 
 def prune(
@@ -214,10 +268,21 @@ def prune(
             setattr(moe, model_attrs["router"], router)
         else:
             # prune fused experts (Llama-4, GlmMoeDsa, etc.)
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indicies
-            ]
-            moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
+            experts_name = _module_name_for_prune(model, moe.experts)
+            _index_select_tensor_attr_for_prune(
+                model,
+                moe.experts,
+                experts_name,
+                "gate_up_proj",
+                retained_expert_indicies,
+            )
+            _index_select_tensor_attr_for_prune(
+                model,
+                moe.experts,
+                experts_name,
+                "down_proj",
+                retained_expert_indicies,
+            )
             retained_count = len(retained_expert_indicies)
             _set_fused_expert_counts(moe, model_attrs, retained_count)
             router_attr = model_attrs["router"]
@@ -231,12 +296,23 @@ def prune(
                 raise AttributeError(
                     f"No router/gate on {moe.__class__.__name__} (expected '{router_attr}')"
                 )
-            router.weight.data = router.weight.data[retained_expert_indicies]
+            router_name = _module_name_for_prune(model, router)
+            _index_select_tensor_attr_for_prune(
+                model,
+                router,
+                router_name,
+                "weight",
+                retained_expert_indicies,
+            )
             _set_fused_router_counts(router, model_attrs, retained_count)
             if hasattr(router, "e_score_correction_bias"):
-                router.e_score_correction_bias.data = router.e_score_correction_bias.data[
-                    retained_expert_indicies
-                ]
+                _index_select_tensor_attr_for_prune(
+                    model,
+                    router,
+                    router_name,
+                    "e_score_correction_bias",
+                    retained_expert_indicies,
+                )
 
     # patch config and dump
     logger.info("Saving pruned model...")
@@ -255,7 +331,7 @@ def prune(
         if not getattr(gen_cfg, "do_sample", False):
             gen_cfg.do_sample = True
     start = time.time()
-    model.save_pretrained(pruned_model_dir)
+    _save_pruned_model(model, pruned_model_dir, model_attrs)
     end = time.time()
     logger.info(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
@@ -314,19 +390,8 @@ def main():
 
     # get local patched model if req'd
     model_name = patched_model_map(model_args.model_name)
-    use_fp8_blackwell = (
-        ("GLM-5.1-FP8" in str(model_args.model_name) or "GLM-5.1-FP8" in model_name)
-        and is_blackwell_gpu()
-    )
-    if use_fp8_blackwell:
-        apply_glm_fp8_blackwell_fallback()
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    load_kwargs = get_from_pretrained_kwargs(
-        device_map="auto",
-        local_files_only=pathlib.Path(model_name).exists(),
-        low_cpu_mem_usage=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    model = load_causal_lm_for_prune(model_name)
     # record activations or load previously recorded activations
     logger.info(
         f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."

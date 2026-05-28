@@ -24,6 +24,21 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def evalplus_attn_implementation(model_name: str) -> str:
+    """Pick an evalplus attention backend that avoids GLM hub-kernel downloads."""
+    override = os.environ.get("REAP_EVALPLUS_ATTN_IMPLEMENTATION")
+    if override:
+        return override
+    if "glm" in str(model_name).lower():
+        return "eager"
+    return "flash_attention_2"
+
+
+def hf_evalplus_supported_for_eval(model_name: str) -> bool:
+    """Whether evalplus' local HF decoder can load this checkpoint directly."""
+    return vllm_supported_for_eval(model_name)
+
+
 def get_original_model_name(model_name: str) -> Tuple[str, bool]:
     original_model_name_map = {
         "Mixtral-8x7B-Instruct-v0.1": "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -214,28 +229,27 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
 
     if eval_args.run_lm_eval:
         results_file_base_name = results_dir / "lm_eval_results"
-        model_args = {
-            "pretrained": model_name,
-            "tensor_parallel_size": num_gpus,
-            "gpu_memory_utilization": 0.85,
-            "num_concurrent": 32,
-            "timeout": 1200,
-            "max_retries": 10,
-            "trust_remote_code": True,
-        }
-        if "baidu" in model_name.lower():
-            logger.warning("Using slow tokenizer for Ernie-4.5")
-            model_args["use_fast_tokenizer"] = False
-        if use_server:
-            model_args["base_url"] = f"{server_endpoint}/v1/completions"
-            model_args["tokenized_requests"] = False
         logger.info(f"Running lm-eval on tasks {eval_args.lm_eval_tasks}")
         is_ernie = "ernie" in model_name.lower()
         logger.warning(f"Is Ernie: {is_ernie}, using batch size 1")
         if use_server:
+            server_model_args = {
+                "pretrained": model_name,
+                "tensor_parallel_size": num_gpus,
+                "gpu_memory_utilization": 0.85,
+                "num_concurrent": 32,
+                "timeout": 1200,
+                "max_retries": 10,
+                "trust_remote_code": True,
+                "base_url": f"{server_endpoint}/v1/completions",
+                "tokenized_requests": False,
+            }
+            if "baidu" in model_name.lower():
+                logger.warning("Using slow tokenizer for Ernie-4.5")
+                server_model_args["use_fast_tokenizer"] = False
             results = evaluator.simple_evaluate(
                 model="local-completions",
-                model_args=model_args,
+                model_args=server_model_args,
                 tasks=eval_args.lm_eval_tasks,
                 num_fewshot=0,
                 random_seed=seed,
@@ -246,9 +260,28 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                 fewshot_as_multiturn=False,
             )
         else:
+            if not vllm_supported_for_eval(model_name) and os.environ.get(
+                "REAP_ENABLE_FP8", ""
+            ).lower() in ("1", "true", "yes"):
+                from reap.glm_fp8_blackwell import (
+                    apply_glm_fp8_blackwell_fallback,
+                    is_blackwell_gpu,
+                )
+
+                if is_blackwell_gpu():
+                    apply_glm_fp8_blackwell_fallback()
+            # parallelize=True keeps accelerate device_map and skips .to(cuda:0)
+            hf_model_args = {
+                "pretrained": model_name,
+                "trust_remote_code": True,
+                "parallelize": True,
+            }
+            if "baidu" in model_name.lower():
+                logger.warning("Using slow tokenizer for Ernie-4.5")
+                hf_model_args["use_fast_tokenizer"] = False
             results = evaluator.simple_evaluate(
                 model="hf",
-                model_args=model_args,
+                model_args=hf_model_args,
                 tasks=eval_args.lm_eval_tasks,
                 num_fewshot=0,
                 batch_size="auto",
@@ -273,44 +306,53 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
 
     try:
         if eval_args.run_evalplus:
-            enable_thinking = True
-            if "qwen" in model_name.lower() or "glm" in model_name.lower():
-                logger.info("Disabling thinking for Qwen/GLM models")
-                enable_thinking = False
-            for task in eval_args.evalplus_tasks:
-                logger.info(f"Running evalplus on task {task}")
-                output_file = results_dir / f"{task}.json"
-                # evalplus fork
-                if use_server:
-                    evalplus_evaluator(
-                        model=model_name,
-                        root=results_dir / "evalplus_results",
-                        dataset=task,
-                        backend="openai",
-                        attn_implementation="flash_attention_2",
-                        greedy=eval_args.greedy,
-                        output_file=output_file,
-                        base_url=f"{server_endpoint}/v1",
-                        temperature=eval_args.temperature
-                        if not eval_args.greedy
-                        else 0.0,
-                        enable_thinking=enable_thinking,
-                        parallel_tasks=eval_args.parallel_tasks,
-                    )
-                else:
-                    evalplus_evaluator(
-                        model=model_name,
-                        root=results_dir / "evalplus_results",
-                        dataset=task,
-                        backend="hf",
-                        attn_implementation="flash_attention_2",
-                        greedy=eval_args.greedy,
-                        output_file=output_file,
-                        temperature=eval_args.temperature
-                        if not eval_args.greedy
-                        else 0.0,
-                        enable_thinking=enable_thinking,
-                    )
+            if not use_server and not hf_evalplus_supported_for_eval(model_name):
+                logger.warning(
+                    "Skipping EvalPlus for %s: the local HF EvalPlus decoder "
+                    "loads the model onto one device. Use a server backend for "
+                    "GLM-5.1 EvalPlus.",
+                    model_name,
+                )
+            else:
+                enable_thinking = True
+                if "qwen" in model_name.lower() or "glm" in model_name.lower():
+                    logger.info("Disabling thinking for Qwen/GLM models")
+                    enable_thinking = False
+                evalplus_attn_impl = evalplus_attn_implementation(model_name)
+                for task in eval_args.evalplus_tasks:
+                    logger.info(f"Running evalplus on task {task}")
+                    output_file = results_dir / f"{task}.json"
+                    # evalplus fork
+                    if use_server:
+                        evalplus_evaluator(
+                            model=model_name,
+                            root=results_dir / "evalplus_results",
+                            dataset=task,
+                            backend="openai",
+                            attn_implementation=evalplus_attn_impl,
+                            greedy=eval_args.greedy,
+                            output_file=output_file,
+                            base_url=f"{server_endpoint}/v1",
+                            temperature=eval_args.temperature
+                            if not eval_args.greedy
+                            else 0.0,
+                            enable_thinking=enable_thinking,
+                            parallel_tasks=eval_args.parallel_tasks,
+                        )
+                    else:
+                        evalplus_evaluator(
+                            model=model_name,
+                            root=results_dir / "evalplus_results",
+                            dataset=task,
+                            backend="hf",
+                            attn_implementation=evalplus_attn_impl,
+                            greedy=eval_args.greedy,
+                            output_file=output_file,
+                            temperature=eval_args.temperature
+                            if not eval_args.greedy
+                            else 0.0,
+                            enable_thinking=enable_thinking,
+                        )
     except Exception as e:
         logger.error(f"An error occurred during evalplus: {e}")
         raise e

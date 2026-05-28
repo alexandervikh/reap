@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
+import pathlib
 from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers import AutoModelForCausalLM
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +290,92 @@ def get_from_pretrained_kwargs(
         kwargs["dtype"] = torch.bfloat16
         kwargs["_dequantize_fp8_checkpoint"] = True
     return kwargs
+
+
+# Staged copies on local overlay (see scripts/stage_glm51_local.sh).
+GLM51_LOCAL_STAGING: dict[str, str] = {
+    "GLM-5.1": "/tmp/GLM-5.1",
+    "GLM-5.1-FP8": "/tmp/GLM-5.1-FP8",
+}
+
+GLM51_LOAD_MODES = frozenset({"lustre", "local", "fast_ram", "cpu_dispatch"})
+
+
+def get_glm51_load_mode(load_mode: str | None = None) -> str:
+    mode = (load_mode or os.environ.get("GLM51_LOAD_MODE", "lustre")).lower()
+    if mode not in GLM51_LOAD_MODES:
+        raise ValueError(
+            f"Invalid GLM51_LOAD_MODE={mode!r}; expected one of {sorted(GLM51_LOAD_MODES)}"
+        )
+    return mode
+
+
+def resolve_model_path_for_load(model_name: str, load_mode: str | None = None) -> str:
+    """Return checkpoint path, optionally preferring a staged copy under /tmp."""
+    mode = get_glm51_load_mode(load_mode)
+    if mode not in ("local", "fast_ram", "cpu_dispatch"):
+        return model_name
+    for key, staged in GLM51_LOCAL_STAGING.items():
+        if key in model_name:
+            staged_path = pathlib.Path(staged)
+            if staged_path.is_dir():
+                logger.info(
+                    "GLM51_LOAD_MODE=%s: using staged checkpoint %s (lustre path was %s)",
+                    mode,
+                    staged_path,
+                    model_name,
+                )
+                return str(staged_path)
+            logger.warning(
+                "GLM51_LOAD_MODE=%s but staged dir missing (%s); using %s",
+                mode,
+                staged_path,
+                model_name,
+            )
+            break
+    return model_name
+
+
+def load_causal_lm_for_prune(
+    model_name: str,
+    *,
+    load_mode: str | None = None,
+    local_files_only: bool | None = None,
+) -> AutoModelForCausalLM:
+    """Load a causal LM for monolithic prune with optional GLM-5.1 load tuning."""
+    mode = get_glm51_load_mode(load_mode)
+    resolved = resolve_model_path_for_load(model_name, mode)
+    if local_files_only is None:
+        local_files_only = pathlib.Path(resolved).exists()
+
+    if mode == "cpu_dispatch":
+        load_kwargs = get_from_pretrained_kwargs(
+            device_map="cpu",
+            local_files_only=local_files_only,
+            low_cpu_mem_usage=False,
+        )
+        logger.info(
+            "GLM51_LOAD_MODE=cpu_dispatch: loading %s on CPU, then dispatch_model_to_auto",
+            resolved,
+        )
+        model = AutoModelForCausalLM.from_pretrained(resolved, **load_kwargs)
+        return dispatch_model_to_auto(model)
+
+    low_cpu_mem_usage = True
+    if mode == "fast_ram":
+        low_cpu_mem_usage = False
+        logger.info(
+            "GLM51_LOAD_MODE=fast_ram: low_cpu_mem_usage=False for %s", resolved
+        )
+
+    load_kwargs = get_from_pretrained_kwargs(
+        device_map="auto",
+        local_files_only=local_files_only,
+        low_cpu_mem_usage=low_cpu_mem_usage,
+    )
+    if mode == "local":
+        logger.info("GLM51_LOAD_MODE=local: resolved path %s", resolved)
+    return AutoModelForCausalLM.from_pretrained(resolved, **load_kwargs)
 
 
 def maybe_dequantize_fp8_config(model_name: str, load_kwargs: dict[str, Any]) -> None:
