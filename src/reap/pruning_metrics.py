@@ -64,6 +64,45 @@ def initialize_pruning_state(
     return layer_state
 
 
+def _resolve_routing_weights(
+    *,
+    router_logits: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: Optional[torch.Tensor],
+    renormalize_router_weights: bool,
+) -> torch.Tensor:
+    """Return per-token expert weights for saliency metrics.
+
+    When ``routing_weights`` is supplied (e.g. from GLM ``route_tokens_to_experts``),
+    use it as-is so we do not softmax raw logits or double-renormalize top-k weights.
+    """
+    if routing_weights is not None:
+        return routing_weights.to(device=router_logits.device, dtype=torch.float)
+
+    weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    if renormalize_router_weights and selected_experts.numel() > 0:
+        topk_weights = torch.gather(weights, 1, selected_experts)
+        weights = weights / topk_weights.sum(dim=-1, keepdim=True)
+        weights = torch.clamp(weights, min=torch.finfo(weights.dtype).eps)
+    return weights
+
+
+def scatter_topk_routing_weights(
+    selected_experts: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Build a dense (tokens, num_experts) matrix from top-k routing outputs."""
+    routing_weights = torch.zeros(
+        selected_experts.shape[0],
+        num_experts,
+        dtype=topk_weights.dtype,
+        device=topk_weights.device,
+    )
+    routing_weights.scatter_(1, selected_experts, topk_weights)
+    return routing_weights
+
+
 def _prepare_pruning_batch(
     *,
     activations: torch.Tensor,
@@ -144,6 +183,7 @@ def update_pruning_state(
     num_experts: int,
     valid_token_mask: Optional[torch.Tensor] = None,
     renormalize_router_weights: bool = False,
+    routing_weights: Optional[torch.Tensor] = None,
 ) -> PreparedPruningBatch:
     """Accumulate pruning saliency metrics for one routed batch into `layer_state`.
 
@@ -174,19 +214,12 @@ def update_pruning_state(
         num_experts, device=device, dtype=torch.float64
     )
 
-    routing_weights = F.softmax(pruning_batch.router_logits, dim=1, dtype=torch.float).to(
-        device
-    )
-    if renormalize_router_weights and pruning_batch.selected_experts.numel() > 0:
-        topk_weights = torch.gather(
-            routing_weights,
-            1,
-            pruning_batch.selected_experts,
-        )
-        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
-        routing_weights = torch.clamp(
-            routing_weights, min=torch.finfo(routing_weights.dtype).eps
-        )
+    routing_weights = _resolve_routing_weights(
+        router_logits=pruning_batch.router_logits,
+        selected_experts=pruning_batch.selected_experts,
+        routing_weights=routing_weights,
+        renormalize_router_weights=renormalize_router_weights,
+    ).to(device)
 
     for i in range(num_experts):
         active_mask = (pruning_batch.selected_experts == i).any(dim=-1).to(device)
@@ -230,6 +263,7 @@ def update_pruning_state_from_selected_experts(
     num_experts: int,
     valid_token_mask: Optional[torch.Tensor] = None,
     renormalize_router_weights: bool = False,
+    routing_weights: Optional[torch.Tensor] = None,
 ) -> None:
     """Accumulate pruning metrics from routed expert outputs only.
 
@@ -258,14 +292,13 @@ def update_pruning_state_from_selected_experts(
     layer_state["pairwise_expert_frequency"] += pairwise_expert_frequency
 
     metric_device = router_logits.device
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(metric_device)
     selected_for_gather = selected_experts.to(metric_device)
-    if renormalize_router_weights and selected_for_gather.numel() > 0:
-        topk_weights = torch.gather(routing_weights, 1, selected_for_gather)
-        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
-        routing_weights = torch.clamp(
-            routing_weights, min=torch.finfo(routing_weights.dtype).eps
-        )
+    resolved_routing_weights = _resolve_routing_weights(
+        router_logits=router_logits,
+        selected_experts=selected_for_gather,
+        routing_weights=routing_weights,
+        renormalize_router_weights=renormalize_router_weights,
+    ).to(metric_device)
 
     ean_sum = torch.zeros(num_experts, device=metric_device, dtype=torch.float64)
     ean_mean = torch.zeros(num_experts, device=metric_device, dtype=torch.float32)
@@ -278,7 +311,7 @@ def update_pruning_state_from_selected_experts(
     for expert_idx, selected_activations in expert_activations.items():
         if selected_activations.numel() == 0:
             continue
-        active_router_weights = routing_weights[:, expert_idx][
+        active_router_weights = resolved_routing_weights[:, expert_idx][
             (selected_for_gather == expert_idx).any(dim=-1)
         ]
         ean_norm = torch.linalg.norm(selected_activations.to(metric_device), dim=-1)

@@ -23,6 +23,7 @@ from reap.metrics import (
 )
 from reap.pruning_metrics import (
     initialize_pruning_state,
+    scatter_topk_routing_weights,
     update_pruning_state,
     update_pruning_state_from_selected_experts,
 )
@@ -114,6 +115,17 @@ def naive_moe_expert_activations(
     gate, up = gu_out.chunk(2, dim=-1)
     hidden = experts_mod.act_fn(gate) * up
     return torch.einsum("eti,ehi->eth", hidden, down_bf).to(flat_input.device)
+
+
+def glm_moe_dsa_route_tokens(
+    moe_module: nn.Module, router_logits: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route tokens with GLM MoE DSA logic (sigmoid, bias, group mask, top-k)."""
+    if not hasattr(moe_module, "route_tokens_to_experts"):
+        raise AttributeError(
+            f"{moe_module.__class__.__name__} has no route_tokens_to_experts"
+        )
+    return moe_module.route_tokens_to_experts(router_logits)
 
 
 def fused_expert_weight_for_observer(
@@ -467,18 +479,27 @@ class MoETransformerObserver(BaseTransformerObserver):
                 router_logits = router_module(flat_input)
                 if router_logits.dim() == 1:
                     router_logits = router_logits.view(-1, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                if (
+                use_glm_routing = (
                     self.hook_config.record_pruning_metrics_only
                     and module.experts.__class__.__name__ == "GlmMoeDsaNaiveMoe"
-                ):
+                    and hasattr(module, "route_tokens_to_experts")
+                )
+                if use_glm_routing:
+                    selected_experts, topk_weights = glm_moe_dsa_route_tokens(
+                        module, router_logits
+                    )
+                else:
+                    _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                if use_glm_routing:
                     sparse_input = flat_input
                     sparse_selected_experts = selected_experts
                     sparse_router_logits = router_logits
+                    sparse_topk_weights = topk_weights
                     if flat_mask is not None:
                         sparse_input = flat_input[flat_mask]
                         sparse_selected_experts = selected_experts[flat_mask]
                         sparse_router_logits = router_logits[flat_mask]
+                        sparse_topk_weights = topk_weights[flat_mask]
                     expert_activations = _glm_moe_dsa_selected_expert_activations(
                         module.experts,
                         sparse_input,
@@ -490,7 +511,12 @@ class MoETransformerObserver(BaseTransformerObserver):
                         selected_experts=sparse_selected_experts,
                         router_logits=sparse_router_logits,
                         num_experts=num_experts,
-                        renormalize_router_weights=self.hook_config.renormalize_router_weights,
+                        routing_weights=scatter_topk_routing_weights(
+                            sparse_selected_experts,
+                            sparse_topk_weights,
+                            num_experts,
+                        ),
+                        renormalize_router_weights=False,
                     )
                     del (
                         flat_input,

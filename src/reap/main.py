@@ -795,7 +795,12 @@ def main():
             try:
                 smoke_test(model, tokenizer)
             except Exception as e:
-                logger.error(f"Smoke test failed: {e}")
+                logger.error(
+                    "Smoke test failed: %s: %r",
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
                 pass
 
         dump_args_to_yaml(
