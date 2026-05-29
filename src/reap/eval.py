@@ -436,38 +436,45 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
         logger.error(f"An error occurred during wildbench: {e}")
         pass
     if eval_args.run_math:
-        try:
-            from evalscope.run import run_task, TaskConfig
-
-            task_config = TaskConfig(
-                model=model_name,
-                generation_config={
-                    "do_sample": False,
-                    "max_new_tokens": 16384,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
-                datasets=[
-                    "gsm8k",
-                    "math_500",
-                ],
-                api_url=f"{server_endpoint}/v1",
-                api_key="EMPTY",
-                timeout=3600,
-                work_dir=results_dir / "evalscope_results",
-                dataset_args={
-                    "gsm8k": {
-                        "few_shot_num": 0,
-                    }
-                },
-                eval_batch_size=32,
-                eval_type="service",
+        if not use_server:
+            logger.warning(
+                "Skipping math eval for %s: requires a vLLM server "
+                "(use HF lm-eval / evalplus only for GLM-5.1)",
+                model_name,
             )
-            logger.info(f"Running evalscope math with config: {task_config}")
-            run_task(task_config)
-            logger.info(f"Finished evaluating evalscope math benchmarks")
-        except Exception as e:
-            logger.error(f"An error occurred during math evaluation: {e}")
-            pass
+        else:
+            try:
+                from evalscope.run import run_task, TaskConfig
+
+                task_config = TaskConfig(
+                    model=model_name,
+                    generation_config={
+                        "do_sample": False,
+                        "max_new_tokens": 16384,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                    datasets=[
+                        "gsm8k",
+                        "math_500",
+                    ],
+                    api_url=f"{server_endpoint}/v1",
+                    api_key="EMPTY",
+                    timeout=3600,
+                    work_dir=results_dir / "evalscope_results",
+                    dataset_args={
+                        "gsm8k": {
+                            "few_shot_num": 0,
+                        }
+                    },
+                    eval_batch_size=32,
+                    eval_type="service",
+                )
+                logger.info(f"Running evalscope math with config: {task_config}")
+                run_task(task_config)
+                logger.info(f"Finished evaluating evalscope math benchmarks")
+            except Exception as e:
+                logger.error(f"An error occurred during math evaluation: {e}")
+                pass
 
     if use_server:
         process.terminate()
