@@ -5,6 +5,35 @@ import os
 import pathlib
 from typing import Any
 
+
+def _augment_cuda_alloc_conf(existing: str) -> str:
+    """Ensure ``expandable_segments:True`` is present in PYTORCH_CUDA_ALLOC_CONF.
+
+    transformers>=5.9 materializes fused MoE expert tensors via ``torch.stack``
+    during ``_finalize_model_loading``. On near-full GPUs (e.g. GLM-5.1 across 8
+    devices) this OOMs against fragmented reserved-but-unallocated memory even
+    though enough total VRAM is free. ``expandable_segments`` lets the caching
+    allocator reuse those fragmented blocks. A user-provided value is preserved.
+    """
+    if "expandable_segments" in existing:
+        return existing
+    if existing:
+        return f"{existing},expandable_segments:True"
+    return "expandable_segments:True"
+
+
+# Set before torch/CUDA caching allocator initialization (parsed lazily on first
+# allocation), so it must run prior to ``import torch`` and any from_pretrained.
+# Newer torch renamed PYTORCH_CUDA_ALLOC_CONF -> PYTORCH_ALLOC_CONF; set both so
+# the setting is honored regardless of the installed torch version, keeping the
+# two in sync if either is already provided.
+_existing_alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get(
+    "PYTORCH_CUDA_ALLOC_CONF", ""
+)
+_alloc_conf = _augment_cuda_alloc_conf(_existing_alloc_conf)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = _alloc_conf
+os.environ["PYTORCH_ALLOC_CONF"] = _alloc_conf
+
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
