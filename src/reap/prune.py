@@ -10,7 +10,7 @@ import yaml
 
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoTokenizer, HfArgumentParser
 
 from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
@@ -32,12 +32,144 @@ from reap.cluster import (
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import (
+    get_moe,
+    assert_merge,
+    MODEL_ATTRS,
+    patched_model_map,
+    get_super_expert_indices,
+    load_causal_lm_for_prune,
+    get_model_device,
+)
 from reap.eval import run_evaluate
 import shutil
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+def _expert_count_attr_names(model_attrs: dict[str, Any]) -> list[str]:
+    """Ordered unique MODEL_ATTRS names for runtime expert-count fields."""
+    names: list[str] = []
+    for key in ("moe_num_experts", "num_experts", "fused_experts_count"):
+        attr = model_attrs.get(key)
+        if attr and attr not in names:
+            names.append(attr)
+    return names
+
+
+def _set_module_expert_counts(
+    module: Any,
+    model_attrs: dict[str, Any],
+    retained_count: int,
+    *,
+    required_attrs: tuple[str, ...] = (),
+) -> None:
+    """Set every mapped expert-count attribute present on ``module``."""
+    for attr in _expert_count_attr_names(model_attrs):
+        if hasattr(module, attr):
+            setattr(module, attr, retained_count)
+    for attr in required_attrs:
+        if not hasattr(module, attr):
+            raise AttributeError(
+                f"{module.__class__.__name__} missing required expert-count "
+                f"attribute {attr!r} (MODEL_ATTRS)"
+            )
+        setattr(module, attr, retained_count)
+
+
+def _set_fused_expert_counts(moe, model_attrs: dict[str, Any], retained_count: int) -> None:
+    """Update fused MoE expert counts using MODEL_ATTRS only.
+
+    ``model_attrs["num_experts"]`` is the HuggingFace **config** key (also applied to
+    ``model.config`` after pruning). The MoE block and experts submodule may use
+    different runtime names (e.g. Llama-4 config ``num_local_experts`` vs
+    ``moe.num_experts``; GLM config ``n_routed_experts`` vs ``experts.num_experts``).
+    """
+    if not model_attrs.get("moe_num_experts"):
+        raise KeyError(
+            "Fused MoE models require MODEL_ATTRS['moe_num_experts'] "
+            f"(missing for {moe.__class__.__name__})"
+        )
+
+    experts = moe.experts
+    experts_attrs: list[str] = []
+    if fused_attr := model_attrs.get("fused_experts_count"):
+        experts_attrs.append(fused_attr)
+    for attr in _expert_count_attr_names(model_attrs):
+        if attr not in experts_attrs:
+            experts_attrs.append(attr)
+    for attr in experts_attrs:
+        if hasattr(experts, attr):
+            setattr(experts, attr, retained_count)
+
+    _set_module_expert_counts(
+        moe,
+        model_attrs,
+        retained_count,
+        required_attrs=(model_attrs["moe_num_experts"],),
+    )
+
+
+def _set_fused_router_counts(router: Any, model_attrs: dict[str, Any], retained_count: int) -> None:
+    """Update router/gate expert-count metadata after fused weight pruning."""
+    _set_module_expert_counts(router, model_attrs, retained_count)
+    if hasattr(router, "out_features"):
+        router.out_features = retained_count
+
+
+def _module_name_for_prune(model: torch.nn.Module, module: torch.nn.Module) -> str:
+    for name, candidate in model.named_modules():
+        if candidate is module:
+            return name
+    raise ValueError(f"Could not locate {module.__class__.__name__} in model modules")
+
+
+def _materialized_tensor_for_prune(
+    model: torch.nn.Module,
+    module_name: str,
+    attr_name: str,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if tensor.device.type != "meta":
+        return tensor.detach()
+
+    from transformers.integrations.accelerate import load_offloaded_parameter
+
+    full_name = f"{module_name}.{attr_name}" if module_name else attr_name
+    return load_offloaded_parameter(model, full_name).detach()
+
+
+def _index_select_tensor_attr_for_prune(
+    model: torch.nn.Module,
+    module: torch.nn.Module,
+    module_name: str,
+    attr_name: str,
+    retained_indices: list[int],
+    *,
+    dim: int = 0,
+) -> None:
+    tensor = getattr(module, attr_name)
+    source = _materialized_tensor_for_prune(model, module_name, attr_name, tensor)
+    index = torch.as_tensor(retained_indices, device=source.device)
+    pruned = source.index_select(dim, index).contiguous()
+    if isinstance(tensor, torch.nn.Parameter):
+        setattr(
+            module,
+            attr_name,
+            torch.nn.Parameter(pruned, requires_grad=tensor.requires_grad),
+        )
+    else:
+        setattr(module, attr_name, pruned)
+
+
+def _save_pruned_model(model, pruned_model_dir: pathlib.Path, model_attrs: dict[str, Any]) -> None:
+    save_kwargs: dict[str, Any] = {}
+    if model_attrs["fused"]:
+        # Keep fused expert tensors in the model's native state-dict namespace. The
+        # legacy reverse mapping expands them into experts.0.* keys, which cannot
+        # be resolved by HF's offloaded-parameter loader for fused expert modules.
+        save_kwargs["save_original_format"] = False
+    model.save_pretrained(pruned_model_dir, **save_kwargs)
 
 
 def prune(
@@ -82,7 +214,9 @@ def prune(
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
         if prune_args.prune_method == "ean_ca":
-            ean = torch.zeros(num_experts, device=model.device, dtype=torch.float32)
+            ean = torch.zeros(
+                num_experts, device=get_model_device(model), dtype=torch.float32
+            )
             for i in range(num_experts):
                 ean[i] = torch.linalg.norm(
                     observer_data[layer]["routed_characteristic_activation"][i], dim=-1
@@ -133,16 +267,52 @@ def prune(
                 )
             setattr(moe, model_attrs["router"], router)
         else:
-            # prune fused experts, only tested for llama-4
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indicies
-            ]
-            moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
-            moe.num_experts = len(retained_expert_indicies)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
-            moe.router.out_features = len(retained_expert_indicies)
-            if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
-                moe.router.num_experts = len(retained_expert_indicies)
+            # prune fused experts (Llama-4, GlmMoeDsa, etc.)
+            experts_name = _module_name_for_prune(model, moe.experts)
+            _index_select_tensor_attr_for_prune(
+                model,
+                moe.experts,
+                experts_name,
+                "gate_up_proj",
+                retained_expert_indicies,
+            )
+            _index_select_tensor_attr_for_prune(
+                model,
+                moe.experts,
+                experts_name,
+                "down_proj",
+                retained_expert_indicies,
+            )
+            retained_count = len(retained_expert_indicies)
+            _set_fused_expert_counts(moe, model_attrs, retained_count)
+            router_attr = model_attrs["router"]
+            if hasattr(moe, router_attr):
+                router = getattr(moe, router_attr)
+            elif hasattr(moe, "router"):
+                router = moe.router
+            elif hasattr(moe, "gate"):
+                router = moe.gate
+            else:
+                raise AttributeError(
+                    f"No router/gate on {moe.__class__.__name__} (expected '{router_attr}')"
+                )
+            router_name = _module_name_for_prune(model, router)
+            _index_select_tensor_attr_for_prune(
+                model,
+                router,
+                router_name,
+                "weight",
+                retained_expert_indicies,
+            )
+            _set_fused_router_counts(router, model_attrs, retained_count)
+            if hasattr(router, "e_score_correction_bias"):
+                _index_select_tensor_attr_for_prune(
+                    model,
+                    router,
+                    router_name,
+                    "e_score_correction_bias",
+                    retained_expert_indicies,
+                )
 
     # patch config and dump
     logger.info("Saving pruned model...")
@@ -156,8 +326,12 @@ def prune(
         ]
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
+    gen_cfg = getattr(model, "generation_config", None)
+    if gen_cfg is not None and getattr(gen_cfg, "top_p", None) is not None:
+        if not getattr(gen_cfg, "do_sample", False):
+            gen_cfg.do_sample = True
     start = time.time()
-    model.save_pretrained(pruned_model_dir)
+    _save_pruned_model(model, pruned_model_dir, model_attrs)
     end = time.time()
     logger.info(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
@@ -217,14 +391,7 @@ def main():
     # get local patched model if req'd
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    # load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=True,
-        local_files_only=True,
-    )
+    model = load_causal_lm_for_prune(model_name)
     # record activations or load previously recorded activations
     logger.info(
         f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
@@ -292,7 +459,12 @@ def main():
             try:
                 smoke_test(model, tokenizer)
             except Exception as e:
-                logger.error(f"Smoke test failed: {e}")
+                logger.error(
+                    "Smoke test failed: %s: %r",
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
                 pass
 
         tokenizer.save_pretrained(pruned_model_dir)
@@ -312,13 +484,13 @@ def main():
 
         dump_args_to_yaml(
             pruned_model_dir,
-            reap_args,
-            ds_args,
-            obs_args,
-            model_args,
-            eval_args,
-            prune_args,
-            cluster_args,
+            reap_args=reap_args,
+            ds_args=ds_args,
+            obs_args=obs_args,
+            model_args=model_args,
+            eval_args=eval_args,
+            prune_args=prune_args,
+            cluster_args=cluster_args,
         )
 
     # eval

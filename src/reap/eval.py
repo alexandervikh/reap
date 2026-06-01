@@ -18,10 +18,44 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 import uvloop
 
 from reap.args import ReapArgs, ModelArgs, EvalArgs
-from reap.model_util import patched_model_map, MODEL_ATTRS
+from reap.model_util import patched_model_map, MODEL_ATTRS, vllm_supported_for_eval
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def evalplus_attn_implementation(model_name: str) -> str:
+    """Pick an evalplus attention backend that avoids GLM hub-kernel downloads."""
+    override = os.environ.get("REAP_EVALPLUS_ATTN_IMPLEMENTATION")
+    if override:
+        return override
+    if "glm" in str(model_name).lower():
+        return "eager"
+    return "flash_attention_2"
+
+
+def _is_glm_moe_checkpoint(model_name: str) -> bool:
+    """Detect GLM MoE checkpoints even when the path omits ``GLM-5.1`` (e.g. /tmp/reap-glm51-pruned/...)."""
+    lower = str(model_name).lower()
+    if "glm-5.1" in lower or "glm_moe_dsa" in lower or "glmmoe" in lower:
+        return True
+    config_path = pathlib.Path(model_name) / "config.json"
+    if config_path.is_file():
+        cfg = json.loads(config_path.read_text())
+        archs = cfg.get("architectures") or []
+        if archs and "glmmoe" in str(archs[0]).lower():
+            return True
+        model_type = str(cfg.get("model_type", "")).lower()
+        if "glm" in model_type and "moe" in model_type:
+            return True
+    return False
+
+
+def hf_evalplus_supported_for_eval(model_name: str) -> bool:
+    """Whether evalplus' local HF decoder can load this checkpoint directly."""
+    if _is_glm_moe_checkpoint(model_name):
+        return False
+    return vllm_supported_for_eval(model_name)
 
 
 def get_original_model_name(model_name: str) -> Tuple[str, bool]:
@@ -36,6 +70,7 @@ def get_original_model_name(model_name: str) -> Tuple[str, bool]:
         "gpt-oss-20b": "openai/gpt-oss-20b",
         "gpt-oss-120b": "openai/gpt-oss-120b",
         "GLM-4.5-Air": "zai-org/GLM-4.5-Air",
+        "GLM-5.1": "zai-org/GLM-5.1",
         "Qwen3-Coder-480B-A35B-Instruct-FP8": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
     }
 
@@ -179,6 +214,12 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
         model_name = model_name.__str__()
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     use_server = eval_args.use_server
+    if use_server and not vllm_supported_for_eval(model_name):
+        logger.warning(
+            "vLLM server disabled for %s (glm_moe_dsa / GLM-5.1); using HF backends",
+            model_name,
+        )
+        use_server = False
     if results_dir is None:
         model_short_name = model_name.split("/")[-1]
         if model_args.num_experts_per_tok_override is not None:
@@ -206,28 +247,27 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
 
     if eval_args.run_lm_eval:
         results_file_base_name = results_dir / "lm_eval_results"
-        model_args = {
-            "pretrained": model_name,
-            "tensor_parallel_size": num_gpus,
-            "gpu_memory_utilization": 0.85,
-            "num_concurrent": 32,
-            "timeout": 1200,
-            "max_retries": 10,
-            "trust_remote_code": True,
-        }
-        if "baidu" in model_name.lower():
-            logger.warning("Using slow tokenizer for Ernie-4.5")
-            model_args["use_fast_tokenizer"] = False
-        if use_server:
-            model_args["base_url"] = f"{server_endpoint}/v1/completions"
-            model_args["tokenized_requests"] = False
         logger.info(f"Running lm-eval on tasks {eval_args.lm_eval_tasks}")
         is_ernie = "ernie" in model_name.lower()
         logger.warning(f"Is Ernie: {is_ernie}, using batch size 1")
         if use_server:
+            server_model_args = {
+                "pretrained": model_name,
+                "tensor_parallel_size": num_gpus,
+                "gpu_memory_utilization": 0.85,
+                "num_concurrent": 32,
+                "timeout": 1200,
+                "max_retries": 10,
+                "trust_remote_code": True,
+                "base_url": f"{server_endpoint}/v1/completions",
+                "tokenized_requests": False,
+            }
+            if "baidu" in model_name.lower():
+                logger.warning("Using slow tokenizer for Ernie-4.5")
+                server_model_args["use_fast_tokenizer"] = False
             results = evaluator.simple_evaluate(
                 model="local-completions",
-                model_args=model_args,
+                model_args=server_model_args,
                 tasks=eval_args.lm_eval_tasks,
                 num_fewshot=0,
                 random_seed=seed,
@@ -238,9 +278,18 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                 fewshot_as_multiturn=False,
             )
         else:
+            # parallelize=True keeps accelerate device_map and skips .to(cuda:0)
+            hf_model_args = {
+                "pretrained": model_name,
+                "trust_remote_code": True,
+                "parallelize": True,
+            }
+            if "baidu" in model_name.lower():
+                logger.warning("Using slow tokenizer for Ernie-4.5")
+                hf_model_args["use_fast_tokenizer"] = False
             results = evaluator.simple_evaluate(
                 model="hf",
-                model_args=model_args,
+                model_args=hf_model_args,
                 tasks=eval_args.lm_eval_tasks,
                 num_fewshot=0,
                 batch_size="auto",
@@ -265,75 +314,91 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
 
     try:
         if eval_args.run_evalplus:
-            enable_thinking = True
-            if "qwen" in model_name.lower() or "glm-4.5" in model_name.lower():
-                logger.info("Disabling thinking for Qwen/GLM models")
-                enable_thinking = False
-            for task in eval_args.evalplus_tasks:
-                logger.info(f"Running evalplus on task {task}")
-                output_file = results_dir / f"{task}.json"
-                # evalplus fork
-                if use_server:
-                    evalplus_evaluator(
-                        model=model_name,
-                        root=results_dir / "evalplus_results",
-                        dataset=task,
-                        backend="openai",
-                        attn_implementation="flash_attention_2",
-                        greedy=eval_args.greedy,
-                        output_file=output_file,
-                        base_url=f"{server_endpoint}/v1",
-                        temperature=eval_args.temperature
-                        if not eval_args.greedy
-                        else 0.0,
-                        enable_thinking=enable_thinking,
-                        parallel_tasks=eval_args.parallel_tasks,
-                    )
-                else:
-                    evalplus_evaluator(
-                        model=model_name,
-                        root=results_dir / "evalplus_results",
-                        dataset=task,
-                        backend="hf",
-                        attn_implementation="flash_attention_2",
-                        greedy=eval_args.greedy,
-                        output_file=output_file,
-                        temperature=eval_args.temperature
-                        if not eval_args.greedy
-                        else 0.0,
-                        enable_thinking=enable_thinking,
-                    )
+            if not use_server and not hf_evalplus_supported_for_eval(model_name):
+                logger.warning(
+                    "Skipping EvalPlus for %s: the local HF EvalPlus decoder "
+                    "loads the model onto one device. Use a server backend for "
+                    "GLM-5.1 EvalPlus.",
+                    model_name,
+                )
+            else:
+                enable_thinking = True
+                if "qwen" in model_name.lower() or "glm" in model_name.lower():
+                    logger.info("Disabling thinking for Qwen/GLM models")
+                    enable_thinking = False
+                evalplus_attn_impl = evalplus_attn_implementation(model_name)
+                for task in eval_args.evalplus_tasks:
+                    logger.info(f"Running evalplus on task {task}")
+                    output_file = results_dir / f"{task}.json"
+                    # evalplus fork
+                    if use_server:
+                        evalplus_evaluator(
+                            model=model_name,
+                            root=results_dir / "evalplus_results",
+                            dataset=task,
+                            backend="openai",
+                            attn_implementation=evalplus_attn_impl,
+                            greedy=eval_args.greedy,
+                            output_file=output_file,
+                            base_url=f"{server_endpoint}/v1",
+                            temperature=eval_args.temperature
+                            if not eval_args.greedy
+                            else 0.0,
+                            enable_thinking=enable_thinking,
+                            parallel_tasks=eval_args.parallel_tasks,
+                        )
+                    else:
+                        evalplus_evaluator(
+                            model=model_name,
+                            root=results_dir / "evalplus_results",
+                            dataset=task,
+                            backend="hf",
+                            attn_implementation=evalplus_attn_impl,
+                            greedy=eval_args.greedy,
+                            output_file=output_file,
+                            temperature=eval_args.temperature
+                            if not eval_args.greedy
+                            else 0.0,
+                            enable_thinking=enable_thinking,
+                        )
     except Exception as e:
         logger.error(f"An error occurred during evalplus: {e}")
-        raise e
-        pass
+        if eval_args.run_evalplus and not use_server and not hf_evalplus_supported_for_eval(
+            model_name
+        ):
+            logger.warning("EvalPlus failed after skip path; continuing without EvalPlus.")
+        else:
+            raise
     try:
         if eval_args.run_livecodebench:
             if not use_server:
-                raise ValueError(
-                    "Current LCB ReapBase model style implementation requries a vLLM server to be running"
+                logger.warning(
+                    "Skipping LiveCodeBench for %s: requires a vLLM server "
+                    "(use HF lm-eval / evalplus only for GLM-5.1)",
+                    model_name,
                 )
-            from lcb_runner.runner.main import main as lcb_main
-            from lcb_runner.runner.main import get_args_dict
+            elif use_server:
+                from lcb_runner.runner.main import main as lcb_main
+                from lcb_runner.runner.main import get_args_dict
 
-            original_model, uncompressed_model = get_original_model_name(model_name)
+                original_model, uncompressed_model = get_original_model_name(model_name)
 
-            lcb_args = get_args_dict(
-                model=original_model,
-                n=1,
-                output_path=results_dir,
-                enable_thinking=False,
-                base_url=f"{server_endpoint}/v1",
-                start_date="2025-01-01",
-                end_date="2025-07-31",
-                evaluate=True,
-                timeout=120,
-                local_model_path=model_name if not uncompressed_model else None,
-                max_tokens=16384,
-            )
-            logger.info(f"Running LiveCodeBench with args: {lcb_args}")
-            lcb_main(lcb_args)
-            logger.info(f"Finished evaluating LiveCodeBench")
+                lcb_args = get_args_dict(
+                    model=original_model,
+                    n=1,
+                    output_path=results_dir,
+                    enable_thinking=False,
+                    base_url=f"{server_endpoint}/v1",
+                    start_date="2025-01-01",
+                    end_date="2025-07-31",
+                    evaluate=True,
+                    timeout=120,
+                    local_model_path=model_name if not uncompressed_model else None,
+                    max_tokens=16384,
+                )
+                logger.info(f"Running LiveCodeBench with args: {lcb_args}")
+                lcb_main(lcb_args)
+                logger.info("Finished evaluating LiveCodeBench")
     except Exception as e:
         logger.error(f"An error occurred during livecodebench: {e}")
         pass
@@ -371,38 +436,45 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
         logger.error(f"An error occurred during wildbench: {e}")
         pass
     if eval_args.run_math:
-        try:
-            from evalscope.run import run_task, TaskConfig
-
-            task_config = TaskConfig(
-                model=model_name,
-                generation_config={
-                    "do_sample": False,
-                    "max_new_tokens": 16384,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
-                datasets=[
-                    "gsm8k",
-                    "math_500",
-                ],
-                api_url=f"{server_endpoint}/v1",
-                api_key="EMPTY",
-                timeout=3600,
-                work_dir=results_dir / "evalscope_results",
-                dataset_args={
-                    "gsm8k": {
-                        "few_shot_num": 0,
-                    }
-                },
-                eval_batch_size=32,
-                eval_type="service",
+        if not use_server:
+            logger.warning(
+                "Skipping math eval for %s: requires a vLLM server "
+                "(use HF lm-eval / evalplus only for GLM-5.1)",
+                model_name,
             )
-            logger.info(f"Running evalscope math with config: {task_config}")
-            run_task(task_config)
-            logger.info(f"Finished evaluating evalscope math benchmarks")
-        except Exception as e:
-            logger.error(f"An error occurred during math evaluation: {e}")
-            pass
+        else:
+            try:
+                from evalscope.run import run_task, TaskConfig
+
+                task_config = TaskConfig(
+                    model=model_name,
+                    generation_config={
+                        "do_sample": False,
+                        "max_new_tokens": 16384,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    },
+                    datasets=[
+                        "gsm8k",
+                        "math_500",
+                    ],
+                    api_url=f"{server_endpoint}/v1",
+                    api_key="EMPTY",
+                    timeout=3600,
+                    work_dir=results_dir / "evalscope_results",
+                    dataset_args={
+                        "gsm8k": {
+                            "few_shot_num": 0,
+                        }
+                    },
+                    eval_batch_size=32,
+                    eval_type="service",
+                )
+                logger.info(f"Running evalscope math with config: {task_config}")
+                run_task(task_config)
+                logger.info(f"Finished evaluating evalscope math benchmarks")
+            except Exception as e:
+                logger.error(f"An error occurred during math evaluation: {e}")
+                pass
 
     if use_server:
         process.terminate()

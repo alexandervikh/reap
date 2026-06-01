@@ -37,7 +37,12 @@ from reap.layerwise_model_utils import (
     safe_get_device,
     has_meta_tensors,
 )
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.observer import glm_moe_dsa_route_tokens
+from reap.pruning_metrics import (
+    initialize_pruning_state,
+    scatter_topk_routing_weights,
+    update_pruning_state,
+)
 from reap.metrics import OnlineStatsTracker
 
 logging.basicConfig(level=logging.INFO)
@@ -636,6 +641,8 @@ class LayerwiseMoEObserver:
 
         # Compute activations for all experts
         activations = torch.zeros((num_experts, *flat_input.shape), device=device)
+        routing_weights = None
+        renormalize_router_weights = self.hook_config.renormalize_router_weights
 
         # TODO(ivanl): model-specific handling of router_module return signature
         def extract_router_logits(router_module, input):
@@ -691,7 +698,16 @@ class LayerwiseMoEObserver:
                     f"Cannot find router in MoE module at block {block_idx}"
                 )
 
-            _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+            if hasattr(moe_module, "route_tokens_to_experts"):
+                selected_experts, topk_weights = glm_moe_dsa_route_tokens(
+                    moe_module, router_logits
+                )
+                routing_weights = scatter_topk_routing_weights(
+                    selected_experts, topk_weights, num_experts
+                )
+                renormalize_router_weights = False
+            else:
+                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
 
             # Compute activations for all experts
             for idx, expert in enumerate(moe_module.experts):
@@ -704,7 +720,8 @@ class LayerwiseMoEObserver:
             router_logits=router_logits,
             num_experts=num_experts,
             valid_token_mask=valid_token_mask,
-            renormalize_router_weights=self.hook_config.renormalize_router_weights,
+            renormalize_router_weights=renormalize_router_weights,
+            routing_weights=routing_weights,
         )
 
         # Clean up

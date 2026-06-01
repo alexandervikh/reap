@@ -51,6 +51,7 @@ from reap.model_util import (
     MODEL_ATTRS,
     patched_model_map,
     get_super_expert_indices,
+    get_model_input_device,
 )
 from reap.eval import run_evaluate
 from reap.cluster_plots import plot_cluster_analysis
@@ -155,7 +156,8 @@ def _profile_model(model, tokenizer, model_args, obs_args, observer):
                 truncation=True,
                 max_length=model_max_length,
             )
-            tokenized = {k: v.to(model.device) for k, v in tokenized.items()}
+            input_device = get_model_input_device(model)
+            tokenized = {k: v.to(input_device) for k, v in tokenized.items()}
             for _ in range(2):
                 _ = model(**tokenized)
         except Exception as e:
@@ -263,10 +265,11 @@ def record_activations(
                 continue
             try:
                 logger.info("No previous data found @ %s", f_name)
+                input_device = get_model_input_device(model)
                 for sample in tqdm(cat_data, desc=f"Processing {category} samples"):
                     attention_mask = sample.get("attention_mask", None)
                     sample = {
-                        k: v.to(model.device) if torch.is_tensor(v) else v
+                        k: v.to(input_device) if torch.is_tensor(v) else v
                         for k, v in sample.items()
                     }
                     with observer.set_attention_mask(attention_mask):
@@ -792,7 +795,12 @@ def main():
             try:
                 smoke_test(model, tokenizer)
             except Exception as e:
-                logger.error(f"Smoke test failed: {e}")
+                logger.error(
+                    "Smoke test failed: %s: %r",
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
                 pass
 
         dump_args_to_yaml(
